@@ -336,6 +336,11 @@ def measurement_form(st):
     if minutes < recommended:
         st.warning(f"Seçilen saha planında önerilen süre {recommended} dk. Simülasyon oluşturulabilir.")
     repeats = st.number_input("Cihaz tekrar sayısı", 1, 10, 1)
+    gap_seconds = st.number_input(
+        "Ölçümler arası bekleme (sn)", min_value=0, value=0, step=2,
+        help="Bir kayıt bittikten sonra sonraki kayıt başlayana kadar geçen süre. "
+             "Arka plan kaydı da bu süre kadar sonra başlar. SVL zamanları 2 saniye çözünürlüklüdür.",
+    )
 
     section(st, "Kayıt ve ses seviyesi")
     name = st.text_input("SVL kayıt adı", value="ORCALI4", max_chars=28)
@@ -366,18 +371,22 @@ def measurement_form(st):
         site_notes=site_notes,
         minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=count,
         length=length, gain=gain, background=background, high_range=high_range, delay=delay,
-        min_gain=min_gain,
+        min_gain=min_gain, gap_seconds=gap_seconds,
     )
 
 
 def build_results(plant, point, setting, mode, day, clock, minutes, repeats, name,
-                  a, c, count, length, gain, background, high_range, delay, site_notes="", min_gain=None):
+                  a, c, count, length, gain, background, high_range, delay, site_notes="",
+                  min_gain=None, gap_seconds=0):
     if not plant.strip() or not point.strip() or not slug(name).strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
+    if gap_seconds < 0 or gap_seconds % 2:
+        raise ValueError("Ölçümler arası bekleme için 0 veya 2'nin katı olan bir saniye değeri gir.")
     title = f"{plant.strip()} / {point.strip()}"
     metadata = f"{title} | {setting} | {mode.strip()}"
     start = datetime.combine(day, clock)
     start -= timedelta(seconds=start.second % 2, microseconds=start.microsecond)
+    record_interval = timedelta(minutes=minutes, seconds=gap_seconds)
     rows = []
     for index in range(repeats + (background is not None)):
         is_background = index == repeats
@@ -386,7 +395,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
         device_id = slug(name)[:max(1, 5 - len(suffix))] + suffix
         level_a = background if is_background else a
         level_c = background + 7.0 if is_background else c
-        config = Measurement(device_id, start + timedelta(minutes=minutes * index),
+        config = Measurement(device_id, start + record_interval * index,
                              minutes * 60, level_a, level_c, 0 if is_background else count,
                              length, gain, delay, high_range, event_min_gain=min_gain)
         data = simulate(config)
