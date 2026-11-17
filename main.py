@@ -31,6 +31,7 @@ C_WEIGHT = (
     -1.3, -2, -3, -4.4, -6.2, -8.5, -11.2,
 )
 PERIODS = ("Türkiye Ek-2 – 5 dk referans", "ISO 1996-2 – elverişli veya geometri koşulu", "ISO 1996-2 – diğer koşullar")
+DEFAULT_POINT_VARIATION_DB = 5.0
 UNAVAILABLE = 0xD000
 
 
@@ -466,9 +467,11 @@ def measurement_form(st):
                       min_value=25.0, max_value=139.0, step=0.01)
         a_high = field(high_col.number_input, "a_high", "LAeq üst sınırı [dB(A)]",
                        min_value=25.0, max_value=139.0, step=0.01)
-        a_bounds = (max(25.0, round(a - 2, 2)) if a_low is None else a_low,
-                    min(139.0, round(a + 2, 2)) if a_high is None else a_high)
-        st.caption("Boş bırakılan sınırlar referansın 2 dB altı veya üstü olarak alınır.")
+        a_bounds = (
+            max(25.0, round(a - DEFAULT_POINT_VARIATION_DB, 2)) if a_low is None else a_low,
+            min(139.0, round(a + DEFAULT_POINT_VARIATION_DB, 2)) if a_high is None else a_high,
+        )
+        st.caption(f"Boş bırakılan sınırlar için referansın ±{DEFAULT_POINT_VARIATION_DB:g} dB çevresi kullanılır.")
     manual_targets = []
     if field(st.checkbox, "set_point_targets", "Nokta bazında manuel hedef belirle", False):
         selected = field(
