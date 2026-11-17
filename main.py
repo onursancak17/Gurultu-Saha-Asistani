@@ -692,12 +692,28 @@ def measurement_form(st):
     period = field(st.selectbox, "period", "TS ISO 1996-1/2 · Çevresel gürültü", PERIODS[0], options=PERIODS)
     section(st, "Tesis ve ölçüm noktası")
     plant = field(st.text_input, "plant", "Tesis adı", "").strip()
-    point_count = field(st.number_input, "point_count", "Ölçüm noktası sayısı", 1, min_value=1, step=1)
-    point = f"{plant}1"
+    independent = field(st.checkbox, "independent_points", "Bağımsız nokta ölçümü", False)
+    independent_range = None
+    first_point = 1
+    if independent:
+        first_point = field(st.number_input, "first_point", "Başlangıç nokta numarası", 1,
+                            min_value=1, step=1)
+        last_point = field(st.number_input, "last_point", "Bitiş nokta numarası (dâhil)", first_point,
+                           min_value=1, step=1)
+        independent_range = (first_point, last_point)
+        point_count = max(0, last_point - first_point + 1)
+        if point_count:
+            st.caption(f"{plant}{first_point} → {plant}{last_point} · Toplam {point_count} nokta")
+        else:
+            st.warning("Bitiş nokta numarası başlangıçtan küçük olamaz.")
+    else:
+        point_count = field(st.number_input, "point_count", "Ölçüm noktası sayısı", 1, min_value=1, step=1)
+    point_numbers = range(first_point, first_point + point_count)
+    point = f"{plant}{first_point}"
     following_points = []
     if point_count > 1:
         st.caption("Her geçiş süresi, önceki noktadaki son kayıt bittiğinde başlar.")
-        for number in range(2, point_count + 1):
+        for number in range(first_point + 1, first_point + point_count):
             transition = field(
                 st.number_input, f"point_transition_{number}",
                 f"Nokta {number - 1} → {number} geçiş süresi (sn)", 0, min_value=0, step=1,
@@ -779,10 +795,10 @@ def measurement_form(st):
     if field(st.checkbox, "set_point_targets", "Nokta bazında manuel hedef belirle", False):
         selected = field(
             st.multiselect, "manual_points", "Manuel hedef verilecek noktalar", [],
-            options=range(1, point_count + 1), multiple=True,
+            options=point_numbers, multiple=True,
             format_func=lambda number: f"{number}. nokta · {plant}{number}",
         )
-        for number in sorted(set(selected).intersection(range(1, point_count + 1))):
+        for number in sorted(set(selected).intersection(point_numbers)):
             manual_a = field(st.number_input, f"point_a_{number}", f"{plant}{number} · Nihai LAeq [dB(A)]", a,
                              min_value=25.0, max_value=139.0, step=0.01)
             manual_c = field(st.number_input, f"point_c_{number}", f"{plant}{number} · Nihai LCeq [dB(C)]",
@@ -846,6 +862,7 @@ def measurement_form(st):
         maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
         spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum, detailed_svl=True,
         device_serial=device_serial,
+        independent_range=independent_range,
         gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
     )
@@ -900,7 +917,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   min_gain=None, gap_seconds=0, following_points=(), seed=None,
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
-                  reference_spectrum=False, detailed_svl=False, device_serial=None):
+                  reference_spectrum=False, detailed_svl=False, device_serial=None,
+                  independent_range=None):
     if not isinstance(clock, time):
         raise ValueError("Başlangıç saatini saat:dakika:saniye biçiminde gir. Örnek 14:25:22.")
     record_name = slug(name)
@@ -910,8 +928,15 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
         raise ValueError("Listeden geçerli bir cihaz seri numarası seç.")
     if gap_seconds < 0:
         raise ValueError("Ölçümler arası bekleme süresi negatif olamaz.")
+    first_point = 1
+    if independent_range is not None:
+        first_point, last_point = independent_range
+        if first_point < 1 or last_point < first_point:
+            raise ValueError("Bitiş nokta numarası başlangıçtan küçük olamaz. Pozitif nokta numaraları gir.")
+        if last_point - first_point != len(following_points):
+            raise ValueError("Seçilen nokta aralığı ile geçiş sayısı uyuşmuyor.")
     points = [(point.strip(), 0)]
-    for number, (next_point, transition) in enumerate(following_points, start=2):
+    for number, (next_point, transition) in enumerate(following_points, start=first_point + 1):
         if not next_point.strip():
             raise ValueError(f"{number}. noktanın adını gir.")
         if transition < 0:
@@ -937,7 +962,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     rng = Random(seed)
     record_count = len(points) * (repeats + (background is not None))
     sequence_width = max(2, len(str(record_count)))
-    for number, (point_name, transition) in enumerate(points, start=1):
+    for number, (point_name, transition) in enumerate(points, start=first_point):
         next_start += timedelta(seconds=transition)
         point_a, point_c = a, c
         spectrum = None
@@ -982,6 +1007,15 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             if record_count > 1:
                 sequence = f"{len(rows) + 1:0{sequence_width}d}"
                 file_stem = record_name[:8 - len(sequence)] + sequence
+            if independent_range is not None:
+                point_stem = slug(plant)[:max(0, 8 - len(str(number)))] + str(number)
+                file_stem = point_stem
+                if repeats > 1 or background is not None:
+                    record_suffix = "FON" if is_background else f"{index + 1:02d}"
+                    prefix_length = max(0, 8 - len(str(number)) - len(record_suffix))
+                    file_stem = slug(plant)[:prefix_length] + str(number) + record_suffix
+                download_suffix = "FON" if is_background else f"{index + 1:02d}"
+                filename = f"SIMULASYON_{slug(point_name)}_{download_suffix}.SVL"
             rows.append((label, filename, config, data, svl(config, data, file_stem)))
         next_start = config.start + duration
     return title, rows, site_notes
