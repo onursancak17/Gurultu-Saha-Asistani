@@ -30,6 +30,11 @@ C_WEIGHT = (
     0, 0, 0, 0, 0, 0, 0, 0, 0, -0.1, -0.2, -0.3, -0.5, -0.8,
     -1.3, -2, -3, -4.4, -6.2, -8.5, -11.2,
 )
+REFERENCE_A_BANDS = (
+    936, 936, 936, 936, 1047, 1072, 1248, 1652, 1914, 2070, 1737,
+    1867, 2277, 3561, 3125, 3136, 2825, 2180, 2038, 1881, 2111,
+    1854, 1883, 2005, 1650, 1327, 1113, 936, 936, 936, 936,
+)
 PERIODS = ("Türkiye Ek-2 – 5 dk referans", "ISO 1996-2 – elverişli veya geometri koşulu", "ISO 1996-2 – diğer koşullar")
 DEFAULT_POINT_VARIATION_DB = 5.0
 UNAVAILABLE = 0xD000
@@ -51,6 +56,8 @@ class Measurement:
     natural_peaks: bool = False
     variable_baseline: bool = False
     variable_spectrum: bool = False
+    spectrum_filter: str = "Z"
+    reference_spectrum: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,7 +96,23 @@ def spectral_shape(center, width):
     return normalized, weighted_energy(normalized, C_WEIGHT)
 
 
-def spectral_endpoints(extended=False):
+def spectral_endpoints(extended=False, reference=False):
+    if reference:
+        # Recover an approximate Z spectrum from the CVKALI22 A-weighted
+        # band averages. Exclude the recurring display floor from the energy.
+        floor_energy = energy(min(REFERENCE_A_BANDS) / 100)
+        bins = [
+            max(energy(level / 100) - floor_energy, 1e-12) / energy(weight)
+            for level, weight in zip(REFERENCE_A_BANDS, A_WEIGHT)
+        ]
+        bass_fraction = [1 / (1 + (frequency / 140) ** 4) for frequency in FREQUENCIES]
+        endpoints = []
+        for fractions in ([1 - fraction for fraction in bass_fraction], bass_fraction):
+            shaped = [value * fraction for value, fraction in zip(bins, fractions)]
+            total_a = weighted_energy(shaped, A_WEIGHT)
+            normalized = [value / total_a for value in shaped]
+            endpoints.append((normalized, weighted_energy(normalized, C_WEIGHT)))
+        return tuple(endpoints)
     return spectral_shape(1800, 0.95), spectral_shape(63 if extended else 125, 1.1)
 
 
@@ -105,8 +128,11 @@ def spectral_mix(c_minus_a, endpoints):
     return [hi * (1 - portion) + lo * portion for hi, lo in zip(high, low)]
 
 
-def spectrum_offsets(bins):
-    return tuple(round(1000 * log10(value)) for value in bins), round(1000 * log10(sum(bins)))
+def spectrum_offsets(bins, weights):
+    return (
+        tuple(round(1000 * log10(value) + 100 * weight) for value, weight in zip(bins, weights)),
+        round(1000 * log10(sum(bins))),
+    )
 
 
 def normal_profile(seconds, rng, fast_variation=0.0):
@@ -177,8 +203,8 @@ def add_natural_peaks(levels, count, rng):
         occupied += duration
 
 
-def vary_spectrum(a, target_delta, peak_gain, rng):
-    (high, high_c), (low, low_c) = spectral_endpoints(extended=True)
+def vary_spectrum(a, target_delta, peak_gain, rng, endpoints, band_weights, reference):
+    (high, high_c), (low, low_c) = endpoints
     target_mix = (energy(target_delta) - high_c) / (low_c - high_c)
     a_energy = [energy(level / 100) for level in a]
     motion = []
@@ -192,7 +218,12 @@ def vary_spectrum(a, target_delta, peak_gain, rng):
         previous_gain = gain
 
     amplitude = min(0.32, 0.10 + 0.85 * target_mix)
-    raw_mix = [target_mix + amplitude * value for value in motion]
+    # In the example, quiet A-weighted intervals retain more bass energy.
+    bass_coupling = 0.025 if reference else 0.0
+    raw_mix = [
+        target_mix + amplitude * value - bass_coupling * ((level - a[0]) / 100)
+        for level, value in zip(a, motion)
+    ]
     # The A-energy-weighted mean of the bass fraction sets the total C/A
     # ratio. Recenter after clipping to keep the target throughout the file.
     target_energy = sum(a_energy) * target_mix
@@ -215,7 +246,10 @@ def vary_spectrum(a, target_delta, peak_gain, rng):
     for a_level, weight, value in zip(a, a_energy, raw_mix):
         mix = max(0.0, min(1.0, value + shift))
         bins = [weight * (hi * (1 - mix) + lo * mix) for hi, lo in zip(high, low)]
-        bands = [max(0, round(1000 * log10(value))) for value in bins]
+        bands = [
+            max(0, round(1000 * log10(value) + 100 * correction))
+            for value, correction in zip(bins, band_weights)
+        ]
         c_level = round(1000 * log10(weight * (high_c * (1 - mix) + low_c * mix)))
         z_level = round(1000 * log10(sum(bins)))
         c.append(c_level)
@@ -232,6 +266,9 @@ def simulate(config, rng=None, spectrum=None):
         raise ValueError("Bir kayıt 1 ile 3600 saniye arasında olmalı.")
     if not isfinite(config.a) or not isfinite(config.c):
         raise ValueError("LAeq ve LCeq sonlu sayı olmalı.")
+    if config.spectrum_filter not in ("Z", "A"):
+        raise ValueError("⅓ oktav spektrum filtresi Z veya A olmalı.")
+    band_weights = A_WEIGHT if config.spectrum_filter == "A" else (0,) * len(FREQUENCIES)
     minimum_gain = config.event_min_gain
     if minimum_gain is None:
         minimum_gain = min(10.0, config.event_gain)
@@ -249,6 +286,9 @@ def simulate(config, rng=None, spectrum=None):
         room = min(config.a - minimum, upper_peak - max(config.a, config.c))
         fast_variation = max(0.0, min(1.0, (room - 4.0) / 7.0))
     relative = normal_profile(config.seconds, rng, fast_variation)
+    if config.reference_spectrum:
+        # The example has a wider central LAeq spread than the general profile.
+        relative = [level * 1.55 for level in relative]
     regular = relative.copy() if config.variable_spectrum else ()
     if config.event_count:
         if config.natural_peaks:
@@ -257,21 +297,28 @@ def simulate(config, rng=None, spectrum=None):
             add_peak_events(relative, config.event_count, config.event_seconds, minimum_gain, config.event_gain, rng)
     normalization = 10 * log10(sum(map(energy, relative)) / config.seconds)
     a = tuple(round(100 * (config.a + level - normalization)) for level in relative)
+    endpoints = spectral_endpoints(extended=True, reference=config.reference_spectrum)
     if spectrum is None:
         c_minus_a = config.c - config.a
-        spectrum = spectral_mix(c_minus_a, spectral_endpoints())
+        spectrum = spectral_mix(
+            c_minus_a, endpoints if config.reference_spectrum else spectral_endpoints(),
+        )
     else:
         c_minus_a = 10 * log10(weighted_energy(spectrum, C_WEIGHT) / weighted_energy(spectrum, A_WEIGHT))
     spectral_rows, band_average, average_z = b"", (), None
     if config.variable_spectrum:
         c, spectral_rows, band_average, average_z = vary_spectrum(
             a, c_minus_a, [level - base for level, base in zip(relative, regular)], rng,
+            endpoints, band_weights, config.reference_spectrum,
         )
     else:
         c = tuple(level + round(100 * c_minus_a) for level in a)
-    if min(a) < minimum * 100 or max(max(a), max(c)) >= upper_peak * 100:
+    # The device checks underrange against integrated RMS. The reference
+    # itself has individual seconds below the high range's 30 dB(A) rating.
+    lower_level = average_centi(a) if config.reference_spectrum else min(a)
+    if lower_level < minimum * 100 or max(max(a), max(c)) >= upper_peak * 100:
         raise ValueError("Senaryodaki seviyeler seçili cihaz aralığına sığmıyor. Seviyeleri veya aralığı düzenle.")
-    offsets, z = spectrum_offsets(spectrum)
+    offsets, z = spectrum_offsets(spectrum, band_weights)
     return Simulation(a, c, offsets, z, spectral_rows, band_average, average_z)
 
 
@@ -323,7 +370,8 @@ def svl(config, data, title):
     user_text = words([0x4203]) + description
     general = [
         0x4004, start_date, start_time, 3, 2, 2 if config.high_range else 1, 0, 1, 1, 3,
-        config.delay, config.seconds, 0, 2, 0, 1, 8, 480, 0, 1, 0, 0, 800, 0, 3,
+        config.delay, config.seconds, 0, 2, 0, 2 if config.spectrum_filter == "A" else 1,
+        8, 480, 0, 1, 0, 0, 800, 0, 3,
         800, 0, 3, 800, 0, 5, 127, 0, 0, 0, 0,
         *([1150] * 6), *([0xFFFF] * 7), 0,
         0x0A00, 0x0A1E, 0, 0x0B00, 0x0B1E, 0, 0x0C00, 0x0D00, 0,
@@ -539,6 +587,9 @@ def measurement_form(st):
         date_col, time_col = st.columns(2)
         day = field(date_col.date_input, "day", "Başlangıç tarihi", now.date(), format="DD.MM.YYYY")
         clock = field(time_col.time_input, "clock", "Başlangıç saati", now.time().replace(second=0, microsecond=0), step=60)
+    start_second = field(st.number_input, "start_second", "Başlangıç saniyesi", 0,
+                         min_value=0, max_value=59, step=1)
+    clock = clock.replace(second=start_second)
     default_minutes = (5, 10, 30)[PERIODS.index(period)]
     period_min = field(st.number_input, "period_min", "Kaynağın tam çalışma döngüsü (dk, biliniyorsa)", 0, min_value=0, max_value=60)
     recommended = max(default_minutes, period_min)
@@ -588,9 +639,11 @@ def measurement_form(st):
     draft = st.session_state.noise_workspace["draft"]
     previous_count = draft.get("peak_count", 0) if draft.get("character") == "Pikli" else 0
     maximum_peaks = field(
-        st.number_input, "maximum_peaks", "Ölçüm başına maksimum pik sayısı", previous_count, min_value=0, step=1,
+        st.number_input, "maximum_peaks", "Saniyelik grafikte maksimum yükseliş sayısı", previous_count,
+        min_value=0, step=1,
         help="Her kaynak açık kaydında sayı sıfır ile bu sınır arasında seçilir. "
-             "Pik artışları yaklaşık 3–8 dB olur. Çoğu 1 saniye sürer, bazıları 2 saniyede söner.",
+             "Yükselişler yaklaşık 3–8 dB olur. Çoğu 1 saniye sürer. "
+             "Cihazın anlık Lpeak değeri ayrı bir ölçüdür.",
     )
 
     with st.expander("Arka plan ve cihaz ayarları"):
@@ -617,6 +670,16 @@ def measurement_form(st):
         )
         delay = field(st.number_input, "delay", "Başlangıç gecikmesi (sn)", 3, min_value=0, max_value=60,
                                 help="Cihaz ayarı olarak kaydedilir. Formdaki başlangıç, kaydın ilk zamanıdır.")
+        spectrum_filter = field(
+            st.selectbox, "spectrum_filter", "⅓ oktav spektrum filtresi", "Z", options=("Z", "A"),
+            format_func=lambda weighting: "A · A ağırlıklı" if weighting == "A" else "Z · Ağırlıksız",
+            help="Bant grafiğine ve SVL’deki ⅓ oktav bantlarına uygulanır.",
+        )
+        reference_spectrum = field(
+            st.checkbox, "reference_spectrum", "CVKALI22 örneğine benzer frekans dağılımı", False,
+            help="Kaynak açık simülasyonunda örnek kaydın ortalama bant biçimini esas alır. "
+                 "Örnek dosya A ağırlıklı ⅓ oktav bantlarıyla kaydedilmiştir.",
+        )
         st.caption("Kayıt adımı 1 sn · ⅓ oktav · Başlangıç senkronizasyonu kapalı")
     return dict(
         plant=plant, point=point, setting=setting, mode=mode, day=day, clock=clock,
@@ -624,6 +687,7 @@ def measurement_form(st):
         minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=0,
         length=1, gain=8.0, background=background, high_range=high_range, delay=delay,
         maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
+        spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum,
         gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
     )
@@ -677,7 +741,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   a, c, count, length, gain, background, high_range, delay, site_notes="",
                   min_gain=None, gap_seconds=0, following_points=(), seed=None,
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
-                  variable_baseline=False, variable_spectrum=False):
+                  variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
+                  reference_spectrum=False):
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
@@ -697,7 +762,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     if c_bounds is not None and (None in c_bounds or c_bounds[0] > c_bounds[1]):
         raise ValueError("LCeq için geçerli bir alt ve üst sınır gir.")
     # Older saved sessions replay the original seeded generator and spectrum.
-    endpoints = spectral_endpoints(extended=True) if a_bounds is not None else None
+    endpoints = spectral_endpoints(extended=True, reference=reference_spectrum) if a_bounds is not None else None
     plant = plant.strip()
     title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
     next_start = datetime.combine(day, clock)
@@ -742,7 +807,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                                  minutes * 60, level_a, level_c, event_count,
                                  length, gain, delay, high_range, event_min_gain=min_gain,
                                  natural_peaks=peak_limit is not None, variable_baseline=variable_baseline,
-                                 variable_spectrum=variable_spectrum)
+                                 variable_spectrum=variable_spectrum, spectrum_filter=spectrum_filter,
+                                 reference_spectrum=reference_spectrum and not is_background)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
@@ -770,7 +836,7 @@ def show_results(st):
                  "Bitiş": (config.start + timedelta(seconds=config.seconds)).strftime("%d.%m.%Y %H:%M:%S"),
                  "LAeq (dB(A))": average_centi(data.a) / 100,
                  "LCeq (dB(C))": average_centi(data.c) / 100,
-                 "Pik olayı": config.event_count,
+                 "Grafikteki yükseliş sayısı": config.event_count,
                  "LCeq − LAeq (dB)": (average_centi(data.c) - average_centi(data.a)) / 100}
                 for label, _, config, data, _ in rows
             ], hide_index=True)
@@ -783,14 +849,14 @@ def show_results(st):
     cols[0].metric("LAeq · dB(A)", f"{average_centi(data.a) / 100:.2f}".replace(".", ","))
     cols[1].metric("LCeq · dB(C)", f"{average_centi(data.c) / 100:.2f}".replace(".", ","))
     st.caption(f"{config.start:%d.%m.%Y %H:%M:%S} · {config.seconds // 60} dk · "
-               f"{len(data.a)} kayıt · {config.event_count} pik olayı")
+               f"{len(data.a)} kayıt · {config.event_count} yükseliş olayı")
     st.line_chart(
         {"Saniye": list(range(1, len(data.a) + 1)),
          "LAeq · dB(A)": [a / 100 for a in data.a],
          "LCeq · dB(C)": [c / 100 for c in data.c]},
         x="Saniye", y=["LAeq · dB(A)", "LCeq · dB(C)"], y_label="Seviye (dB)",
     )
-    with st.expander("Ortalama ⅓ oktav spektrumu"):
+    with st.expander(f"Ortalama ⅓ oktav spektrumu · {config.spectrum_filter} filtresi"):
         spectrum = {
             "Hz": [f"{frequency:g}" for frequency in FREQUENCIES],
             "Leq (dB)": [level / 100 for level in average_bands(data)],
