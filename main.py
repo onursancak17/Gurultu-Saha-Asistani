@@ -37,6 +37,7 @@ REFERENCE_A_BANDS = (
 )
 PERIODS = ("Türkiye Ek-2 – 5 dk referans", "ISO 1996-2 – elverişli veya geometri koşulu", "ISO 1996-2 – diğer koşullar")
 DEFAULT_POINT_VARIATION_DB = 5.0
+DEVICE_SERIALS = (107410, 107406, 23287)
 UNAVAILABLE = 0xD000
 STAT_LEVELS = (1, 10, 20, 30, 40, 50, 60, 70, 80, 90)
 STAT_CLASSES = 120
@@ -61,6 +62,7 @@ class Measurement:
     spectrum_filter: str = "Z"
     reference_spectrum: bool = False
     detailed_svl: bool = False
+    device_serial: int | None = None
 
 
 @dataclass(frozen=True)
@@ -473,8 +475,9 @@ def svl(config, data, title):
     file_header = words([0x0E01]) + device_filename.ljust(8, b" ") + words(
         [0x0300, start_date, start_time] + [0] * 6
     )
-    # Zero serial number and report no field calibration on synthetic data.
-    unit = words([0x0B02, 0, 971, 114, 0, 1, 1, 114, 114, 1, 0])
+    serial = config.device_serial or 0
+    # SVAN 971 unit header stores the serial in two 16-bit words.
+    unit = words([0x0B02, serial & 0xFFFF, 971, 114, 0, 1, 1, 114, 114, 1, serial >> 16])
     calibration = words([0x0B47, 0, 0, 0, 0, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 9400, 0xFFFF])
     user_text = words([0x4203]) + description
     general = [
@@ -773,6 +776,10 @@ def measurement_form(st):
     )
 
     with st.expander("Arka plan ve cihaz ayarları"):
+        device_serial = field(
+            st.selectbox, "device_serial", "Cihaz seri numarası", None, options=(None, *DEVICE_SERIALS),
+            format_func=lambda serial: "Seri numarası seç" if serial is None else str(serial),
+        )
         manual_c = field(st.checkbox, "manual_c", "Genel LCeq referansı belirle", False)
         c = field(st.number_input, "c", "Referans LCeq [dB(C)]", min(145.0, a + 7.0),
                   min_value=-10.0, max_value=145.0, step=0.01) if manual_c else None
@@ -814,6 +821,7 @@ def measurement_form(st):
         length=1, gain=8.0, background=background, high_range=high_range, delay=delay,
         maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
         spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum, detailed_svl=True,
+        device_serial=device_serial,
         gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
     )
@@ -868,10 +876,12 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   min_gain=None, gap_seconds=0, following_points=(), seed=None,
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
-                  reference_spectrum=False, detailed_svl=False):
+                  reference_spectrum=False, detailed_svl=False, device_serial=None):
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
+    if device_serial is not None and device_serial not in DEVICE_SERIALS:
+        raise ValueError("Listeden geçerli bir cihaz seri numarası seç.")
     if gap_seconds < 0:
         raise ValueError("Ölçümler arası bekleme süresi negatif olamaz.")
     points = [(point.strip(), 0)]
@@ -935,7 +945,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                                  natural_peaks=peak_limit is not None, variable_baseline=variable_baseline,
                                  variable_spectrum=variable_spectrum, spectrum_filter=spectrum_filter,
                                  reference_spectrum=reference_spectrum and not is_background,
-                                 detailed_svl=detailed_svl)
+                                 detailed_svl=detailed_svl, device_serial=device_serial)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
