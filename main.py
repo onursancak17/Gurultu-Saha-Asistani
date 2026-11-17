@@ -50,6 +50,7 @@ class Measurement:
     event_min_gain: float | None = None
     natural_peaks: bool = False
     variable_baseline: bool = False
+    variable_spectrum: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,9 @@ class Simulation:
     c: tuple[int, ...]
     spectrum_offsets: tuple[int, ...]
     z_offset: int
+    spectral_rows: bytes = b""
+    band_average: tuple[int, ...] = ()
+    average_z: int | None = None
 
 
 def energy(level):
@@ -66,6 +70,12 @@ def energy(level):
 
 def average_centi(series):
     return round(1000 * log10(sum(energy(level / 100) for level in series) / len(series)))
+
+
+def average_bands(data):
+    return data.band_average or tuple(
+        average_centi([max(0, a + offset) for a in data.a]) for offset in data.spectrum_offsets
+    )
 
 
 def weighted_energy(bins, weights):
@@ -167,6 +177,56 @@ def add_natural_peaks(levels, count, rng):
         occupied += duration
 
 
+def vary_spectrum(a, target_delta, peak_gain, rng):
+    (high, high_c), (low, low_c) = spectral_endpoints(extended=True)
+    target_mix = (energy(target_delta) - high_c) / (low_c - high_c)
+    a_energy = [energy(level / 100) for level in a]
+    motion = []
+    trend = peak_color = 0.0
+    previous_gain = 0.0
+    for gain in peak_gain:
+        trend = 0.88 * trend + rng.uniform(-0.27, 0.27)
+        if gain and not previous_gain:
+            peak_color = rng.choice((-0.7, 0.0, 0.7))
+        motion.append(trend + rng.uniform(-0.18, 0.18) + peak_color * min(1.0, gain / 5))
+        previous_gain = gain
+
+    amplitude = min(0.32, 0.10 + 0.85 * target_mix)
+    raw_mix = [target_mix + amplitude * value for value in motion]
+    # The A-energy-weighted mean of the bass fraction sets the total C/A
+    # ratio. Recenter after clipping to keep the target throughout the file.
+    target_energy = sum(a_energy) * target_mix
+    lower, upper = -max(raw_mix), 1 - min(raw_mix)
+    for _ in range(32):
+        midpoint = (lower + upper) / 2
+        mixed_energy = sum(
+            weight * max(0.0, min(1.0, value + midpoint)) for weight, value in zip(a_energy, raw_mix)
+        )
+        if mixed_energy < target_energy:
+            lower = midpoint
+        else:
+            upper = midpoint
+
+    shift = (lower + upper) / 2
+    packed = bytearray()
+    c = []
+    z = []
+    band_energy = [0.0] * len(FREQUENCIES)
+    for a_level, weight, value in zip(a, a_energy, raw_mix):
+        mix = max(0.0, min(1.0, value + shift))
+        bins = [weight * (hi * (1 - mix) + lo * mix) for hi, lo in zip(high, low)]
+        bands = [max(0, round(1000 * log10(value))) for value in bins]
+        c_level = round(1000 * log10(weight * (high_c * (1 - mix) + low_c * mix)))
+        z_level = round(1000 * log10(sum(bins)))
+        c.append(c_level)
+        z.append(z_level)
+        for index, level in enumerate(bands):
+            band_energy[index] += energy(level / 100)
+        packed += words([0, a_level, c_level, a_level, *bands, a_level, c_level, z_level])
+    average = tuple(round(1000 * log10(value / len(a))) for value in band_energy)
+    return tuple(c), bytes(packed), average, average_centi(z)
+
+
 def simulate(config, rng=None, spectrum=None):
     if not 1 <= config.seconds <= 3600:
         raise ValueError("Bir kayıt 1 ile 3600 saniye arasında olmalı.")
@@ -189,6 +249,7 @@ def simulate(config, rng=None, spectrum=None):
         room = min(config.a - minimum, upper_peak - max(config.a, config.c))
         fast_variation = max(0.0, min(1.0, (room - 4.0) / 7.0))
     relative = normal_profile(config.seconds, rng, fast_variation)
+    regular = relative.copy() if config.variable_spectrum else ()
     if config.event_count:
         if config.natural_peaks:
             add_natural_peaks(relative, config.event_count, rng)
@@ -201,11 +262,17 @@ def simulate(config, rng=None, spectrum=None):
         spectrum = spectral_mix(c_minus_a, spectral_endpoints())
     else:
         c_minus_a = 10 * log10(weighted_energy(spectrum, C_WEIGHT) / weighted_energy(spectrum, A_WEIGHT))
-    c = tuple(level + round(100 * c_minus_a) for level in a)
+    spectral_rows, band_average, average_z = b"", (), None
+    if config.variable_spectrum:
+        c, spectral_rows, band_average, average_z = vary_spectrum(
+            a, c_minus_a, [level - base for level, base in zip(relative, regular)], rng,
+        )
+    else:
+        c = tuple(level + round(100 * c_minus_a) for level in a)
     if min(a) < minimum * 100 or max(max(a), max(c)) >= upper_peak * 100:
         raise ValueError("Senaryodaki seviyeler seçili cihaz aralığına sığmıyor. Seviyeleri veya aralığı düzenle.")
     offsets, z = spectrum_offsets(spectrum)
-    return Simulation(a, c, offsets, z)
+    return Simulation(a, c, offsets, z, spectral_rows, band_average, average_z)
 
 
 def words(values):
@@ -274,10 +341,12 @@ def svl(config, data, title):
         1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0,
     ]
     # Logger records contain flags, three Leq profiles, 31 bands and A/C/Z totals.
-    samples = bytearray()
-    for a, c in zip(data.a, data.c):
-        bands = [max(0, a + offset) for offset in data.spectrum_offsets]
-        samples += words([0, a, c, a, *bands, a, c, a + data.z_offset])
+    samples = data.spectral_rows
+    if not samples:
+        samples = bytearray()
+        for a, c in zip(data.a, data.c):
+            bands = [max(0, a + offset) for offset in data.spectrum_offsets]
+            samples += words([0, a, c, a, *bands, a, c, a + data.z_offset])
 
     main_results = [0x4407, 0x0307]
     for profile, series in enumerate((data.a, data.c, data.a)):
@@ -289,11 +358,9 @@ def svl(config, data, title):
             UNAVAILABLE, UNAVAILABLE,
         ])
     spectrum = [0x2710, 0x0101, 2000, 31, 3]
-    spectrum += [
-        average_centi([max(0, a + offset) for a in data.a])
-        for offset in data.spectrum_offsets
-    ]
-    spectrum += [average_centi(data.a), average_centi(data.c), average_centi(data.a) + data.z_offset]
+    spectrum += average_bands(data)
+    total_z = data.average_z if data.average_z is not None else average_centi(data.a) + data.z_offset
+    spectrum += [average_centi(data.a), average_centi(data.c), total_z]
     summary = record([0x0359, 2, 0]) + record(main_results) + record(spectrum)
     logger_size = len(samples) + len(summary)
     logger = words([0x0E0F, 1, 0, 2000, 31, 3]) + pack(
@@ -556,7 +623,7 @@ def measurement_form(st):
         site_notes=site_notes,
         minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=0,
         length=1, gain=8.0, background=background, high_range=high_range, delay=delay,
-        maximum_peaks=maximum_peaks, variable_baseline=True,
+        maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
         gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
     )
@@ -610,7 +677,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   a, c, count, length, gain, background, high_range, delay, site_notes="",
                   min_gain=None, gap_seconds=0, following_points=(), seed=None,
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
-                  variable_baseline=False):
+                  variable_baseline=False, variable_spectrum=False):
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
@@ -674,7 +741,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             config = Measurement(device_id, next_start + record_interval * index,
                                  minutes * 60, level_a, level_c, event_count,
                                  length, gain, delay, high_range, event_min_gain=min_gain,
-                                 natural_peaks=peak_limit is not None, variable_baseline=variable_baseline)
+                                 natural_peaks=peak_limit is not None, variable_baseline=variable_baseline,
+                                 variable_spectrum=variable_spectrum)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
@@ -725,10 +793,7 @@ def show_results(st):
     with st.expander("Ortalama ⅓ oktav spektrumu"):
         spectrum = {
             "Hz": [f"{frequency:g}" for frequency in FREQUENCIES],
-            "Leq (dB)": [
-                average_centi([max(0, a + offset) for a in data.a]) / 100
-                for offset in data.spectrum_offsets
-            ],
+            "Leq (dB)": [level / 100 for level in average_bands(data)],
         }
         st.bar_chart(spectrum, x="Hz", y="Leq (dB)", sort=False)
         st.dataframe(spectrum, hide_index=True)
