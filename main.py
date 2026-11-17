@@ -1,12 +1,15 @@
 """SVAN 971 için etiketli eğitim ve yazılım testi simülasyonu."""
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from functools import partial
 from zoneinfo import ZoneInfo
 from html import escape
 from io import BytesIO
+import json
 from math import isfinite, log10, log2
 from random import Random
 import re
+from secrets import token_hex
 from struct import pack
 from unicodedata import normalize
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -260,33 +263,116 @@ def run_app():
 
     st.set_page_config(page_title="Gürültü Saha Asistanı", layout="wide", initial_sidebar_state="collapsed")
     st.markdown(STYLE, unsafe_allow_html=True)
+    storage = st.components.v2.component("noise_workspace_storage", js=WORKSPACE_STORAGE)
+    with st.container(key="noise-storage"):
+        storage_slot = st.empty()
+    if "noise_workspace" not in st.session_state:
+        with storage_slot.container():
+            result = storage(data={"read": True}, key="noise_workspace_bridge",
+                             on_loaded_change=lambda: None, on_failed_change=lambda: None)
+        if result.loaded is None:
+            st.caption("Son çalışma yükleniyor…")
+            return
+        restore_workspace(st, result.loaded)
+        st.rerun()
+
     html(DRAWER, height=0)
+    render_workspace(st)
+    with storage_slot.container():
+        storage(data={"workspace": json.dumps(st.session_state.noise_workspace, default=lambda value: value.isoformat())},
+                key="noise_workspace_bridge", on_loaded_change=lambda: None, on_failed_change=lambda: None)
+    if st.session_state.get("noise_workspace_bridge", {}).get("failed"):
+        st.warning("Tarayıcı çalışma kaydını saklayamıyor.")
+
+
+def restore_workspace(st, raw):
+    try:
+        workspace = json.loads(raw)
+        if not isinstance(workspace.get("draft"), dict):
+            raise ValueError("Invalid draft")
+    except (AttributeError, TypeError, ValueError):
+        workspace = {"draft": {}, "run": None}
+    st.session_state.noise_workspace = workspace
+    saved_run = workspace.get("run")
+    if saved_run:
+        try:
+            inputs = dict(saved_run["inputs"])
+            inputs["day"] = date.fromisoformat(inputs["day"])
+            inputs["clock"] = time.fromisoformat(inputs["clock"])
+            st.session_state.results = build_results(**inputs, seed=saved_run["seed"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            workspace["run"] = None
+            st.session_state.noise_restore_failed = True
+
+
+def reset_workspace(st):
+    st.session_state.noise_workspace = {"draft": {}, "run": None}
+    for key in list(st.session_state):
+        if key.startswith("noise_field_") or key in (
+            "device_selected", "results", "noise_defaults", "noise_restore_failed",
+        ):
+            del st.session_state[key]
+
+
+def work_field(st, widget, key, label, default=None, **options):
+    draft = st.session_state.noise_workspace["draft"]
+    defaults = st.session_state.setdefault("noise_defaults", {})
+    widget_key = f"noise_field_{key}"
+    if widget_key not in st.session_state:
+        saved = draft.get(key, default)
+        if isinstance(saved, str) and isinstance(default, (date, time)):
+            try:
+                saved = type(default).fromisoformat(saved)
+            except ValueError:
+                saved = default
+        defaults[key] = saved
+    selected = defaults[key]
+    if "options" in options:
+        choices = options["options"]
+        options["index"] = choices.index(selected) if selected in choices else choices.index(default)
+    else:
+        options["value"] = selected
+    value = widget(label, key=widget_key, **options)
+    draft[key] = value
+    return value
+
+
+def render_workspace(st):
+    draft = st.session_state.noise_workspace["draft"]
     with st.sidebar:
         st.markdown("## Gürültü Saha Asistanı")
-        page = st.radio("Menü", ("Ana ekran", "Ölçüm oluştur", "Sonuçlar"), label_visibility="collapsed")
+        page = work_field(st, st.radio, "page", "Menü", "Ana ekran",
+                          options=("Ana ekran", "Ölçüm oluştur", "Sonuçlar"), label_visibility="collapsed")
         st.caption("SVAN 971 · Simülasyon")
+        st.button("Sıfırla", key="reset_workspace", on_click=reset_workspace, args=(st,),
+                  help="Bu tarayıcıdaki formu ve son simülasyon sonucunu temizler.")
 
     st.markdown(
         '<header class="noise-hero"><h1>Gürültü Saha Asistanı</h1>'
         '<p>Svantek SVAN 971 · Simülasyon</p></header>',
         unsafe_allow_html=True,
     )
+    if st.session_state.pop("noise_restore_failed", False):
+        st.warning("Son sonuç geri yüklenemedi. Kayıtlı formdan yeni simülasyon oluşturabilirsin.")
     if page == "Sonuçlar":
         show_results(st)
         return
-    if page == "Ana ekran" and not st.session_state.get("device_selected"):
+    if page == "Ana ekran" and not draft.get("device_selected"):
         with st.container(border=True):
             st.subheader("SVAN 971")
             st.caption("Svantek · Çevresel gürültü")
-            if st.button("SVAN 971’i seç", type="primary", use_container_width=True):
-                st.session_state.device_selected = True
-                st.rerun()
+            st.button("SVAN 971’i seç", type="primary", use_container_width=True,
+                      on_click=lambda: draft.update(device_selected=True))
         return
 
     inputs = measurement_form(st)
     if st.button("Ölçüm Yap", type="primary", use_container_width=True):
         try:
-            st.session_state.results = build_results(**inputs)
+            seed = token_hex(16)
+            st.session_state.results = build_results(**inputs, seed=seed)
+            st.session_state.noise_workspace["run"] = {"inputs": inputs, "seed": seed}
+            draft.pop("selected_record", None)
+            st.session_state.pop("noise_field_selected_record", None)
         except ValueError as error:
             st.error(str(error))
             return
@@ -299,28 +385,30 @@ def section(st, label):
 
 
 def measurement_form(st):
+    field = partial(work_field, st)
     section(st, "Ölçüm metodu")
-    period = st.selectbox("TS ISO 1996-1/2 · Çevresel gürültü", PERIODS)
+    period = field(st.selectbox, "period", "TS ISO 1996-1/2 · Çevresel gürültü", PERIODS[0], options=PERIODS)
     section(st, "Tesis ve ölçüm noktası")
-    plant = st.text_input("Tesis adı").strip()
-    point_count = st.number_input("Ölçüm noktası sayısı", min_value=1, value=1, step=1)
+    plant = field(st.text_input, "plant", "Tesis adı", "").strip()
+    point_count = field(st.number_input, "point_count", "Ölçüm noktası sayısı", 1, min_value=1, step=1)
     point = f"{plant}1"
     following_points = []
     if point_count > 1:
         st.caption("Her geçiş süresi, önceki noktadaki son kayıt bittiğinde başlar.")
         for number in range(2, point_count + 1):
-            transition = st.number_input(
-                f"Nokta {number - 1} → {number} geçiş süresi (sn)",
-                min_value=0, value=0, step=1, key=f"point_transition_{number}",
+            transition = field(
+                st.number_input, f"point_transition_{number}",
+                f"Nokta {number - 1} → {number} geçiş süresi (sn)", 0, min_value=0, step=1,
             )
             following_points.append((f"{plant}{number}", transition))
-    setting = st.selectbox("Ortam", ("Dış ortam", "İç ortam"))
-    mode = st.text_input("İşletme modu", placeholder="Örn. tesis tam yükte")
+    setting = field(st.selectbox, "setting", "Ortam", "Dış ortam", options=("Dış ortam", "İç ortam"))
+    mode = field(st.text_input, "mode", "İşletme modu", "", placeholder="Örn. tesis tam yükte")
     with st.expander("Saha bilgileri"):
-        placement = st.selectbox("Mikrofon konumu", ("Belirtilmedi", "Serbest alan", "Cephe önü", "Yüzeye monteli", "Oda içi"))
-        height = st.number_input("Mikrofon yüksekliği (m)", min_value=0.0, value=None, step=0.1)
-        distance = st.number_input("Kaynağa yatay uzaklık (m)", min_value=0.0, value=None, step=0.5)
-        weather = st.text_input("Hava koşulları ve saha notu", placeholder="Rüzgâr hızı/yönü, sıcaklık, nem ve yağış")
+        placement = field(st.selectbox, "placement", "Mikrofon konumu", "Belirtilmedi",
+                          options=("Belirtilmedi", "Serbest alan", "Cephe önü", "Yüzeye monteli", "Oda içi"))
+        height = field(st.number_input, "height", "Mikrofon yüksekliği (m)", min_value=0.0, step=0.1)
+        distance = field(st.number_input, "distance", "Kaynağa yatay uzaklık (m)", min_value=0.0, step=0.5)
+        weather = field(st.text_input, "weather", "Hava koşulları ve saha notu", "", placeholder="Rüzgâr hızı/yönü, sıcaklık, nem ve yağış")
     site_notes = " · ".join(filter(None, (
         placement if placement != "Belirtilmedi" else "",
         f"Mikrofon {height:g} m" if height is not None else "",
@@ -332,54 +420,58 @@ def measurement_form(st):
     now = datetime.now(ZoneInfo("Europe/Istanbul"))
     with st.container(key="datetime"):
         date_col, time_col = st.columns(2)
-        day = date_col.date_input("Başlangıç tarihi", value=now.date(), format="DD.MM.YYYY")
-        clock = time_col.time_input("Başlangıç saati", value=now.time().replace(second=0, microsecond=0), step=60)
+        day = field(date_col.date_input, "day", "Başlangıç tarihi", now.date(), format="DD.MM.YYYY")
+        clock = field(time_col.time_input, "clock", "Başlangıç saati", now.time().replace(second=0, microsecond=0), step=60)
     default_minutes = (5, 10, 30)[PERIODS.index(period)]
-    period_min = st.number_input("Kaynağın tam çalışma döngüsü (dk, biliniyorsa)", 0, 60, 0)
+    period_min = field(st.number_input, "period_min", "Kaynağın tam çalışma döngüsü (dk, biliniyorsa)", 0, min_value=0, max_value=60)
     recommended = max(default_minutes, period_min)
-    manual = st.toggle("Ölçüm süresini manuel belirle")
+    manual = field(st.toggle, "manual_duration", "Ölçüm süresini manuel belirle", False)
     if manual:
-        minutes = st.number_input("Ölçüm süresi (dk)", 1, 60, recommended, key=f"duration-{recommended}")
+        minutes = field(st.number_input, "duration", "Ölçüm süresi (dk)", recommended, min_value=1, max_value=60)
     else:
         minutes = recommended
         st.caption(f"Örnek kayıt süresi {minutes} dk")
     if minutes < recommended:
         st.warning(f"Seçilen saha planında önerilen süre {recommended} dk. Simülasyon oluşturulabilir.")
-    repeats = st.number_input("Cihaz tekrar sayısı", 1, 10, 1)
-    gap_seconds = st.number_input(
-        "Aynı noktadaki ölçümler arası bekleme (sn)", min_value=0, value=0, step=1,
+    repeats = field(st.number_input, "repeats", "Cihaz tekrar sayısı", 1, min_value=1, max_value=10)
+    gap_seconds = field(
+        st.number_input, "gap", "Aynı noktadaki ölçümler arası bekleme (sn)", 0, min_value=0, step=1,
         help="Aynı noktadaki tekrarlar ve arka plan kaydı için kullanılır.",
     )
 
     section(st, "Kayıt ve ses seviyesi")
-    name = st.text_input("SVL kayıt adı", value="ORCALI4", max_chars=28)
-    a = st.number_input("Kaynak açık · Hedef toplam LAeq [dB(A)]", 25.0, 139.0, 60.0, 0.1)
-    character = st.radio("Ses karakteri", ("Kararlı", "Pikli"), horizontal=True)
+    name = field(st.text_input, "record_name", "SVL kayıt adı", "ORCALI4", max_chars=28)
+    a = field(st.number_input, "a", "Kaynak açık · Hedef toplam LAeq [dB(A)]", 60.0,
+              min_value=25.0, max_value=139.0, step=0.1)
+    character = field(st.radio, "character", "Ses karakteri", "Kararlı", options=("Kararlı", "Pikli"), horizontal=True)
     count = 0
     length = 2
     min_gain, gain = 10.0, 25.0
     if character == "Pikli":
-        count = st.number_input("Pik sayısı", 1, 200, 3)
-        length = st.number_input("Her pikin süresi (sn)", 1, 120, 2)
+        count = field(st.number_input, "peak_count", "Pik sayısı", 3, min_value=1, max_value=200)
+        length = field(st.number_input, "peak_length", "Her pikin süresi (sn)", 2, min_value=1, max_value=120)
         low_col, high_col = st.columns(2)
-        min_gain = low_col.number_input("En düşük pik artışı (dB)", 1.0, 40.0, 10.0, 0.5)
-        gain = high_col.number_input("En yüksek pik artışı (dB)", 1.0, 40.0, 25.0, 0.5)
+        min_gain = field(low_col.number_input, "min_gain", "En düşük pik artışı (dB)", 10.0,
+                         min_value=1.0, max_value=40.0, step=0.5)
+        gain = field(high_col.number_input, "gain", "En yüksek pik artışı (dB)", 25.0,
+                     min_value=1.0, max_value=40.0, step=0.5)
         st.caption("Artışlar o andaki normal seviyeye eklenir. Pikler dâhil tüm kayıt hedef LAeq’ye ayarlanır.")
 
     with st.expander("Arka plan ve cihaz ayarları"):
-        manual_c = st.checkbox("Hedef LCeq’yi manuel belirle")
-        c = st.number_input("Hedef LCeq [dB(C)]", -10.0, 145.0, min(145.0, a + 7.0), 0.1) if manual_c else a + 7.0
-        has_background = st.checkbox("Kaynak kapalıyken arka plan kaydı ekle")
-        background = st.number_input("Arka plan hedef LAeq [dB(A)]", 25.0, 139.0, 45.0, 0.1) if has_background else None
-        high_range = st.selectbox(
-            "Cihaz aralığı",
-            (False, True),
+        manual_c = field(st.checkbox, "manual_c", "Hedef LCeq’yi manuel belirle", False)
+        c = field(st.number_input, "c", "Hedef LCeq [dB(C)]", min(145.0, a + 7.0),
+                  min_value=-10.0, max_value=145.0, step=0.1) if manual_c else a + 7.0
+        has_background = field(st.checkbox, "has_background", "Kaynak kapalıyken arka plan kaydı ekle", False)
+        background = field(st.number_input, "background", "Arka plan hedef LAeq [dB(A)]", 45.0,
+                           min_value=25.0, max_value=139.0, step=0.1) if has_background else None
+        high_range = field(
+            st.selectbox, "high_range", "Cihaz aralığı", False, options=(False, True),
             format_func=lambda high: "Yüksek · 30 dB(A) Leq / 140 dB Peak"
             if high else "Düşük · 25 dB(A) Leq / 123 dB Peak",
             help="SVAN 971’in alt Leq sınırı ve üst anlık tepe sınırı. "
                  "Yüksek aralık, daha yüksek tepelere yer açar.",
         )
-        delay = st.number_input("Başlangıç gecikmesi (sn)", 0, 60, 3,
+        delay = field(st.number_input, "delay", "Başlangıç gecikmesi (sn)", 3, min_value=0, max_value=60,
                                 help="Cihaz ayarı olarak kaydedilir. Formdaki başlangıç, kaydın ilk zamanıdır.")
         st.caption("Kayıt adımı 1 sn · ⅓ oktav · Başlangıç senkronizasyonu kapalı")
     return dict(
@@ -393,7 +485,7 @@ def measurement_form(st):
 
 def build_results(plant, point, setting, mode, day, clock, minutes, repeats, name,
                   a, c, count, length, gain, background, high_range, delay, site_notes="",
-                  min_gain=None, gap_seconds=0, following_points=()):
+                  min_gain=None, gap_seconds=0, following_points=(), seed=None):
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
@@ -413,6 +505,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     duration = timedelta(minutes=minutes)
     record_interval = duration + timedelta(seconds=gap_seconds)
     rows = []
+    rng = Random(seed)
     for number, (point_name, transition) in enumerate(points, start=1):
         next_start += timedelta(seconds=transition)
         metadata = f"{plant} / {point_name} | {setting} | {mode.strip()}"
@@ -431,7 +524,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             config = Measurement(device_id, next_start + record_interval * index,
                                  minutes * 60, level_a, level_c, 0 if is_background else count,
                                  length, gain, delay, high_range, event_min_gain=min_gain)
-            data = simulate(config)
+            data = simulate(config, rng)
             filename = f"SIMULASYON_{record_name}_{suffix}.SVL"
             rows.append((label, filename, config, data, svl(config, data, metadata + " | " + label)))
         next_start = config.start + duration
@@ -457,7 +550,8 @@ def show_results(st):
             ], hide_index=True)
     if any(config.start.second % 2 for _, _, config, _, _ in rows):
         st.caption("Çizelge tam başlangıç saatlerini gösterir. SVL başlığı tek saniyeleri önceki çift saniyeye yazar.")
-    selection = st.selectbox("Kayıt", range(len(rows)), format_func=lambda index: rows[index][0])
+    selection = work_field(st, st.selectbox, "selected_record", "Kayıt", 0,
+                           options=range(len(rows)), format_func=lambda index: rows[index][0])
     label, filename, config, data, file_bytes = rows[selection]
     cols = st.columns(2)
     cols[0].metric("LAeq · dB(A)", f"{average_centi(data.a) / 100:.2f}".replace(".", ","))
@@ -493,8 +587,34 @@ def show_results(st):
     st.caption("Simülasyon verisi · Eğitim ve yazılım testi")
 
 
+WORKSPACE_STORAGE = """
+const storageKey = "gurultu-saha-asistani.workspace.v1";
+const lastWrite = new WeakMap();
+let failed = false;
+
+export default function ({data, parentElement, setStateValue}) {
+  if (!data) return;
+  try {
+    if (data.read) {
+      setStateValue("loaded", localStorage.getItem(storageKey) ?? "");
+    } else if (lastWrite.get(parentElement) !== data.workspace) {
+      localStorage.setItem(storageKey, data.workspace);
+      lastWrite.set(parentElement, data.workspace);
+    }
+  } catch {
+    if (data.read) setStateValue("loaded", "");
+    if (!failed) {
+      failed = true;
+      setStateValue("failed", true);
+    }
+  }
+}
+"""
+
+
 STYLE = """
 <style>
+.st-key-noise-storage {display:none;}
 .block-container {max-width:1280px;padding-top:2rem;}
 .noise-hero {background:linear-gradient(120deg,#102e40,#081b2a);
     color:#edf6fa;padding:26px 24px;margin:0 0 22px;border-radius:24px;}
