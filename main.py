@@ -49,6 +49,7 @@ class Measurement:
     high_range: bool = False
     event_min_gain: float | None = None
     natural_peaks: bool = False
+    variable_baseline: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,7 +99,7 @@ def spectrum_offsets(bins):
     return tuple(round(1000 * log10(value)) for value in bins), round(1000 * log10(sum(bins)))
 
 
-def normal_profile(seconds, rng):
+def normal_profile(seconds, rng, fast_variation=0.0):
     # Interpolate between independent levels at irregular intervals, with
     # smaller second-to-second variation on top of the slower changes.
     levels = []
@@ -112,6 +113,10 @@ def normal_profile(seconds, rng):
             for index in range(span)
         )
         previous = next_level
+    if fast_variation:
+        for index, level in enumerate(levels):
+            deviation = rng.gauss(0.0, 4.5 if rng.random() < 0.15 else 2.0)
+            levels[index] = level + fast_variation * max(-7.0, min(7.0, deviation))
     return levels
 
 
@@ -178,7 +183,12 @@ def simulate(config, rng=None, spectrum=None):
         raise ValueError("Pikler arasında ve kaydın iki ucunda en az birer normal saniye bırakılmalı.")
 
     rng = rng if rng is not None else Random()
-    relative = normal_profile(config.seconds, rng)
+    minimum, upper_peak = (30, 140) if config.high_range else (25, 123)
+    fast_variation = 0.0
+    if config.variable_baseline:
+        room = min(config.a - minimum, upper_peak - max(config.a, config.c))
+        fast_variation = max(0.0, min(1.0, (room - 4.0) / 7.0))
+    relative = normal_profile(config.seconds, rng, fast_variation)
     if config.event_count:
         if config.natural_peaks:
             add_natural_peaks(relative, config.event_count, rng)
@@ -192,7 +202,6 @@ def simulate(config, rng=None, spectrum=None):
     else:
         c_minus_a = 10 * log10(weighted_energy(spectrum, C_WEIGHT) / weighted_energy(spectrum, A_WEIGHT))
     c = tuple(level + round(100 * c_minus_a) for level in a)
-    minimum, upper_peak = (30, 140) if config.high_range else (25, 123)
     if min(a) < minimum * 100 or max(max(a), max(c)) >= upper_peak * 100:
         raise ValueError("Senaryodaki seviyeler seçili cihaz aralığına sığmıyor. Seviyeleri veya aralığı düzenle.")
     offsets, z = spectrum_offsets(spectrum)
@@ -547,7 +556,8 @@ def measurement_form(st):
         site_notes=site_notes,
         minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=0,
         length=1, gain=8.0, background=background, high_range=high_range, delay=delay,
-        maximum_peaks=maximum_peaks, gap_seconds=gap_seconds, following_points=following_points,
+        maximum_peaks=maximum_peaks, variable_baseline=True,
+        gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
     )
 
@@ -599,7 +609,8 @@ def repeat_offsets(repeats, margin, rng):
 def build_results(plant, point, setting, mode, day, clock, minutes, repeats, name,
                   a, c, count, length, gain, background, high_range, delay, site_notes="",
                   min_gain=None, gap_seconds=0, following_points=(), seed=None,
-                  a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None):
+                  a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
+                  variable_baseline=False):
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
@@ -663,7 +674,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             config = Measurement(device_id, next_start + record_interval * index,
                                  minutes * 60, level_a, level_c, event_count,
                                  length, gain, delay, high_range, event_min_gain=min_gain,
-                                 natural_peaks=peak_limit is not None)
+                                 natural_peaks=peak_limit is not None, variable_baseline=variable_baseline)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
