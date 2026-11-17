@@ -658,13 +658,18 @@ def render_workspace(st):
         return
 
     inputs = measurement_form(st)
-    if st.button("Ölçüm Yap", type="primary", use_container_width=True):
+    saved_run = st.session_state.noise_workspace.get("run")
+    previous_limit = saved_run["inputs"].get("maximum_peaks") if saved_run else None
+    limit_changed = saved_run is not None and previous_limit != inputs["maximum_peaks"]
+    if st.button("Ölçüm Yap", type="primary", use_container_width=True) or limit_changed:
         try:
             seed = token_hex(16)
             st.session_state.results = build_results(**inputs, seed=seed)
             st.session_state.noise_workspace["run"] = {"inputs": inputs, "seed": seed}
             draft.pop("selected_record", None)
             st.session_state.pop("noise_field_selected_record", None)
+            if limit_changed:
+                st.success(f"Pik üst sınırı {inputs['maximum_peaks']} uygulandı. Noktaların sonuçları yenilendi.")
         except ValueError as error:
             st.error(str(error))
             return
@@ -782,7 +787,8 @@ def measurement_form(st):
     maximum_peaks = field(
         st.number_input, "maximum_peaks", "Saniyelik grafikte maksimum yükseliş sayısı", previous_count,
         min_value=0, step=1,
-        help="Ölçüm Yap’a bastığında her kaynak açık kaydı için sayı sıfır ile bu sınır arasında ayrı seçilir. "
+        help="Her kaynak açık kaydı için sayı sıfır ile bu sınır arasında ayrı seçilir. "
+             "Sonuç varken bu sınırı değiştirirsen sonuçlar otomatik yenilenir. "
              "Yükselişler yaklaşık 3–8 dB olur. Çoğu 1 saniye sürer. "
              "Cihazın anlık Lpeak değeri ayrı bir ölçüdür.",
     )
@@ -988,7 +994,8 @@ def show_results(st):
     saved_maximum = saved_inputs.get("maximum_peaks")
     draft_maximum = workspace["draft"].get("maximum_peaks", saved_maximum)
     if draft_maximum != saved_maximum:
-        st.info("Pik sınırını değiştirdin. Ekranda önceki sonuç var. Yeni sınırı uygulamak için Ölçüm Yap’a bas.")
+        st.info("Pik sınırı değişti. Ölçüm oluştur ekranında yeni sonuçları oluştur.")
+        return
     if saved_maximum is not None:
         applied_maximum = min(saved_maximum, (rows[0][2].seconds - 1) // 2)
         st.caption(f"Bu çalışmada kaynak açık kayıt başına seçim aralığı 0–{applied_maximum} yükseliş.")
@@ -1015,6 +1022,8 @@ def show_results(st):
     cols[1].metric("LCeq · dB(C)", f"{average_centi(data.c) / 100:.2f}".replace(".", ","))
     st.caption(f"{config.start:%d.%m.%Y %H:%M:%S} · {config.seconds // 60} dk · "
                f"{len(data.a)} kayıt · {len(data.peak_starts)} işaretli yükseliş")
+    if saved_maximum is not None:
+        st.metric("Bu kayıttaki pik / girilen üst sınır", f"{len(data.peak_starts)} / {saved_maximum}")
     show_noise_chart(st, data)
     with st.expander(f"Ortalama ⅓ oktav spektrumu · {config.spectrum_filter} filtresi"):
         spectrum = {
