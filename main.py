@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from html import escape
 from io import BytesIO
 import json
-from math import isfinite, log10, log2
+from math import ceil, floor, isfinite, log10, log2
 from random import Random
 import re
 from secrets import token_hex
@@ -65,17 +65,23 @@ def average_centi(series):
     return round(1000 * log10(sum(energy(level / 100) for level in series) / len(series)))
 
 
-def spectrum_offsets(c_minus_a):
-    # Two broad, synthetic spectral shapes. Mix in the linear energy domain.
-    def shape(center, width):
-        bins = [energy(-3 * (log2(freq / center) / width) ** 2) for freq in FREQUENCIES]
-        a_energy = sum(value * energy(weight) for value, weight in zip(bins, A_WEIGHT))
-        normalized = [value / a_energy for value in bins]
-        c_energy = sum(value * energy(weight) for value, weight in zip(normalized, C_WEIGHT))
-        return normalized, c_energy
+def weighted_energy(bins, weights):
+    return sum(value * energy(weight) for value, weight in zip(bins, weights))
 
-    high, high_c = shape(1800, 0.95)
-    low, low_c = shape(125, 1.1)
+
+def spectral_shape(center, width):
+    bins = [energy(-3 * (log2(freq / center) / width) ** 2) for freq in FREQUENCIES]
+    a_energy = weighted_energy(bins, A_WEIGHT)
+    normalized = [value / a_energy for value in bins]
+    return normalized, weighted_energy(normalized, C_WEIGHT)
+
+
+def spectral_endpoints(extended=False):
+    return spectral_shape(1800, 0.95), spectral_shape(63 if extended else 125, 1.1)
+
+
+def spectral_mix(c_minus_a, endpoints):
+    (high, high_c), (low, low_c) = endpoints
     ratio = energy(c_minus_a)
     if not high_c <= ratio <= low_c:
         raise ValueError(
@@ -83,7 +89,10 @@ def spectrum_offsets(c_minus_a):
             f"{10 * log10(high_c):.2f} ile {10 * log10(low_c):.2f} dB arasında olmalı."
         )
     portion = (ratio - high_c) / (low_c - high_c)
-    bins = [hi * (1 - portion) + lo * portion for hi, lo in zip(high, low)]
+    return [hi * (1 - portion) + lo * portion for hi, lo in zip(high, low)]
+
+
+def spectrum_offsets(bins):
     return tuple(round(1000 * log10(value)) for value in bins), round(1000 * log10(sum(bins)))
 
 
@@ -131,7 +140,7 @@ def add_peak_events(levels, count, duration, minimum_gain, maximum_gain, rng):
             levels[index] += gain
 
 
-def simulate(config, rng=None):
+def simulate(config, rng=None, spectrum=None):
     if not 1 <= config.seconds <= 3600:
         raise ValueError("Bir kayıt 1 ile 3600 saniye arasında olmalı.")
     if not isfinite(config.a) or not isfinite(config.c):
@@ -152,11 +161,16 @@ def simulate(config, rng=None):
         add_peak_events(relative, config.event_count, config.event_seconds, minimum_gain, config.event_gain, rng)
     normalization = 10 * log10(sum(map(energy, relative)) / config.seconds)
     a = tuple(round(100 * (config.a + level - normalization)) for level in relative)
-    c = tuple(level + round(100 * (config.c - config.a)) for level in a)
+    if spectrum is None:
+        c_minus_a = config.c - config.a
+        spectrum = spectral_mix(c_minus_a, spectral_endpoints())
+    else:
+        c_minus_a = 10 * log10(weighted_energy(spectrum, C_WEIGHT) / weighted_energy(spectrum, A_WEIGHT))
+    c = tuple(level + round(100 * c_minus_a) for level in a)
     minimum, upper_peak = (30, 140) if config.high_range else (25, 123)
     if min(a) < minimum * 100 or max(max(a), max(c)) >= upper_peak * 100:
         raise ValueError("Senaryodaki seviyeler seçili cihaz aralığına sığmıyor. Seviyeleri veya aralığı düzenle.")
-    offsets, z = spectrum_offsets(config.c - config.a)
+    offsets, z = spectrum_offsets(spectrum)
     return Simulation(a, c, offsets, z)
 
 
@@ -314,7 +328,7 @@ def reset_workspace(st):
             del st.session_state[key]
 
 
-def work_field(st, widget, key, label, default=None, **options):
+def work_field(st, widget, key, label, default=None, *, multiple=False, **options):
     draft = st.session_state.noise_workspace["draft"]
     defaults = st.session_state.setdefault("noise_defaults", {})
     widget_key = f"noise_field_{key}"
@@ -327,7 +341,9 @@ def work_field(st, widget, key, label, default=None, **options):
                 saved = default
         defaults[key] = saved
     selected = defaults[key]
-    if "options" in options:
+    if multiple:
+        options["default"] = [item for item in selected if item in options["options"]]
+    elif "options" in options:
         choices = options["options"]
         options["index"] = choices.index(selected) if selected in choices else choices.index(default)
     else:
@@ -441,8 +457,31 @@ def measurement_form(st):
 
     section(st, "Kayıt ve ses seviyesi")
     name = field(st.text_input, "record_name", "SVL kayıt adı", "ORCALI4", max_chars=28)
-    a = field(st.number_input, "a", "Kaynak açık · Hedef toplam LAeq [dB(A)]", 60.0,
-              min_value=25.0, max_value=139.0, step=0.1)
+    a = field(st.number_input, "a", "Kaynak açık · Referans LAeq [dB(A)]", 60.0,
+              min_value=25.0, max_value=139.0, step=0.01)
+    a_bounds = (a, a)
+    if point_count > 1:
+        low_col, high_col = st.columns(2)
+        a_low = field(low_col.number_input, "a_low", "LAeq alt sınırı [dB(A)]",
+                      min_value=25.0, max_value=139.0, step=0.01)
+        a_high = field(high_col.number_input, "a_high", "LAeq üst sınırı [dB(A)]",
+                       min_value=25.0, max_value=139.0, step=0.01)
+        a_bounds = (max(25.0, round(a - 2, 2)) if a_low is None else a_low,
+                    min(139.0, round(a + 2, 2)) if a_high is None else a_high)
+        st.caption("Boş bırakılan sınırlar referansın 2 dB altı veya üstü olarak alınır.")
+    manual_targets = []
+    if field(st.checkbox, "set_point_targets", "Nokta bazında manuel hedef belirle", False):
+        selected = field(
+            st.multiselect, "manual_points", "Manuel hedef verilecek noktalar", [],
+            options=range(1, point_count + 1), multiple=True,
+            format_func=lambda number: f"{number}. nokta · {plant}{number}",
+        )
+        for number in sorted(set(selected).intersection(range(1, point_count + 1))):
+            manual_a = field(st.number_input, f"point_a_{number}", f"{plant}{number} · Nihai LAeq [dB(A)]", a,
+                             min_value=25.0, max_value=139.0, step=0.01)
+            manual_c = field(st.number_input, f"point_c_{number}", f"{plant}{number} · Nihai LCeq [dB(C)]",
+                             min_value=-10.0, max_value=145.0, step=0.01, placeholder="Otomatik")
+            manual_targets.append((number, manual_a, manual_c))
     character = field(st.radio, "character", "Ses karakteri", "Kararlı", options=("Kararlı", "Pikli"), horizontal=True)
     count = 0
     length = 2
@@ -458,9 +497,17 @@ def measurement_form(st):
         st.caption("Artışlar o andaki normal seviyeye eklenir. Pikler dâhil tüm kayıt hedef LAeq’ye ayarlanır.")
 
     with st.expander("Arka plan ve cihaz ayarları"):
-        manual_c = field(st.checkbox, "manual_c", "Hedef LCeq’yi manuel belirle", False)
-        c = field(st.number_input, "c", "Hedef LCeq [dB(C)]", min(145.0, a + 7.0),
-                  min_value=-10.0, max_value=145.0, step=0.1) if manual_c else a + 7.0
+        manual_c = field(st.checkbox, "manual_c", "Genel LCeq referansı belirle", False)
+        c = field(st.number_input, "c", "Referans LCeq [dB(C)]", min(145.0, a + 7.0),
+                  min_value=-10.0, max_value=145.0, step=0.01) if manual_c else None
+        c_bounds = None
+        if field(st.checkbox, "limit_c", "Otomatik LCeq için sınır belirle", False):
+            low_col, high_col = st.columns(2)
+            c_low = field(low_col.number_input, "c_low", "LCeq alt sınırı [dB(C)]",
+                          min_value=-10.0, max_value=145.0, step=0.01)
+            c_high = field(high_col.number_input, "c_high", "LCeq üst sınırı [dB(C)]",
+                           min_value=-10.0, max_value=145.0, step=0.01)
+            c_bounds = (c_low, c_high)
         has_background = field(st.checkbox, "has_background", "Kaynak kapalıyken arka plan kaydı ekle", False)
         background = field(st.number_input, "background", "Arka plan hedef LAeq [dB(A)]", 45.0,
                            min_value=25.0, max_value=139.0, step=0.1) if has_background else None
@@ -480,12 +527,58 @@ def measurement_form(st):
         minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=count,
         length=length, gain=gain, background=background, high_range=high_range, delay=delay,
         min_gain=min_gain, gap_seconds=gap_seconds, following_points=following_points,
+        a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
     )
+
+
+def point_targets(a, c, a_bounds, c_bounds, manual, single_point, endpoints, rng):
+    min_delta = ceil(1000 * log10(endpoints[0][1])) / 100
+    max_delta = floor(1000 * log10(endpoints[1][1])) / 100
+    a_low, a_high = a_bounds
+    c_low, c_high = c_bounds if c_bounds else (-10.0, 145.0)
+    reference_delta = c - a if c is not None else 6.0
+    if manual:
+        point_a, point_c = manual
+        if point_c is not None:
+            return point_a, point_c, 0.35
+    else:
+        if single_point and c is not None and c_bounds is None:
+            return a, c, 0.35
+        a_low = max(a_low, round(c_low - max_delta, 2))
+        a_high = min(a_high, round(c_high - min_delta, 2))
+        if a_low > a_high:
+            raise ValueError("LAeq ve LCeq aralıkları seçili frekans modeliyle uyuşmuyor.")
+        point_a = round(rng.triangular(a_low, a_high, min(a_high, max(a_low, a))), 2)
+
+    delta_low = max(min_delta, round(c_low - point_a, 2))
+    delta_high = min(max_delta, round(c_high - point_a, 2))
+    if c_bounds is None:
+        delta_low, delta_high = max(delta_low, min(0.0, delta_high)), min(delta_high, max(15.0, delta_low))
+    if delta_low > delta_high:
+        raise ValueError("Bu LAeq hedefiyle belirtilen LCeq aralığında sonuç üretilemiyor.")
+    delta = rng.triangular(delta_low, delta_high, min(delta_high, max(delta_low, reference_delta)))
+    point_c = round(point_a + delta, 2)
+    margin = min(0.35, point_c - c_low, c_high - point_c)
+    if not manual and not single_point:
+        margin = min(margin, point_a - a_low, a_high - point_a)
+    return point_a, point_c, max(0.0, margin)
+
+
+def repeat_offsets(repeats, margin, rng):
+    # Pair equal and opposite energy changes so the combined Leq stays at target.
+    offsets = [0.0] if repeats % 2 else []
+    limit = 1 - energy(-margin)
+    for _ in range(repeats // 2):
+        change = rng.uniform(limit / 4, limit)
+        offsets.extend((10 * log10(1 - change), 10 * log10(1 + change)))
+    rng.shuffle(offsets)
+    return offsets
 
 
 def build_results(plant, point, setting, mode, day, clock, minutes, repeats, name,
                   a, c, count, length, gain, background, high_range, delay, site_notes="",
-                  min_gain=None, gap_seconds=0, following_points=(), seed=None):
+                  min_gain=None, gap_seconds=0, following_points=(), seed=None,
+                  a_bounds=None, c_bounds=None, manual_targets=()):
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
@@ -499,6 +592,13 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             raise ValueError(f"Nokta {number - 1} → {number} geçiş süresi negatif olamaz.")
         points.append((next_point.strip(), transition))
     multi_point = len(points) > 1
+    overrides = {number: (level_a, level_c) for number, level_a, level_c in manual_targets}
+    if a_bounds is not None and not a_bounds[0] <= a <= a_bounds[1]:
+        raise ValueError("Referans LAeq, alt ve üst LAeq sınırlarının arasında olmalı.")
+    if c_bounds is not None and (None in c_bounds or c_bounds[0] > c_bounds[1]):
+        raise ValueError("LCeq için geçerli bir alt ve üst sınır gir.")
+    # Older saved sessions replay the original seeded generator and spectrum.
+    endpoints = spectral_endpoints(extended=True) if a_bounds is not None else None
     plant = plant.strip()
     title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
     next_start = datetime.combine(day, clock)
@@ -509,6 +609,18 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     for number, (point_name, transition) in enumerate(points, start=1):
         next_start += timedelta(seconds=transition)
         metadata = f"{plant} / {point_name} | {setting} | {mode.strip()}"
+        point_a, point_c = a, c
+        spectrum = None
+        shifts = [0.0] * repeats
+        if endpoints is not None:
+            try:
+                point_a, point_c, margin = point_targets(
+                    a, c, a_bounds, c_bounds, overrides.get(number), not multi_point, endpoints, rng,
+                )
+                spectrum = spectral_mix(round(point_c - point_a, 2), endpoints)
+                shifts = repeat_offsets(repeats, margin, rng)
+            except ValueError as error:
+                raise ValueError(f"{point_name} · {error}") from error
         for index in range(repeats + (background is not None)):
             is_background = index == repeats
             label = "Arka plan" if is_background else f"Kaynak açık · Tekrar {index + 1}"
@@ -519,12 +631,15 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                 device_id = f"{len(rows) + 1:05d}"
             else:
                 device_id = record_name[:max(1, 5 - len(suffix))] + suffix
-            level_a = background if is_background else a
-            level_c = background + 7.0 if is_background else c
+            level_a = background if is_background else point_a + shifts[index]
+            level_c = background + 7.0 if is_background else point_c + shifts[index]
             config = Measurement(device_id, next_start + record_interval * index,
                                  minutes * 60, level_a, level_c, 0 if is_background else count,
                                  length, gain, delay, high_range, event_min_gain=min_gain)
-            data = simulate(config, rng)
+            try:
+                data = simulate(config, rng, None if is_background else spectrum)
+            except ValueError as error:
+                raise ValueError(f"{point_name} · {label} · {error}") from error
             filename = f"SIMULASYON_{record_name}_{suffix}.SVL"
             rows.append((label, filename, config, data, svl(config, data, metadata + " | " + label)))
         next_start = config.start + duration
@@ -545,8 +660,11 @@ def show_results(st):
         with st.expander("Ölçüm zaman çizelgesi"):
             st.dataframe([
                 {"Kayıt": label, "Başlangıç": config.start.strftime("%d.%m.%Y %H:%M:%S"),
-                 "Bitiş": (config.start + timedelta(seconds=config.seconds)).strftime("%d.%m.%Y %H:%M:%S")}
-                for label, _, config, _, _ in rows
+                 "Bitiş": (config.start + timedelta(seconds=config.seconds)).strftime("%d.%m.%Y %H:%M:%S"),
+                 "LAeq (dB(A))": average_centi(data.a) / 100,
+                 "LCeq (dB(C))": average_centi(data.c) / 100,
+                 "LCeq − LAeq (dB)": (average_centi(data.c) - average_centi(data.a)) / 100}
+                for label, _, config, data, _ in rows
             ], hide_index=True)
     if any(config.start.second % 2 for _, _, config, _, _ in rows):
         st.caption("Çizelge tam başlangıç saatlerini gösterir. SVL başlığı tek saniyeleri önceki çift saniyeye yazar.")
