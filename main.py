@@ -69,6 +69,7 @@ class Simulation:
     spectral_rows: bytes = b""
     band_average: tuple[int, ...] = ()
     average_z: int | None = None
+    peak_starts: tuple[int, ...] = ()
 
 
 def energy(level):
@@ -181,6 +182,7 @@ def add_peak_events(levels, count, duration, minimum_gain, maximum_gain, rng):
         gain = 10 * log10(minimum_factor + scale * (factor - minimum_factor))
         for index in range(start, start + duration):
             levels[index] += gain
+    return tuple(starts)
 
 
 def add_natural_peaks(levels, count, rng):
@@ -194,13 +196,16 @@ def add_natural_peaks(levels, count, rng):
     free_seconds = len(levels) - sum(durations)
     slots = sorted(rng.sample(range(1, free_seconds), count))
     occupied = 0
+    starts = []
     for slot, duration in zip(slots, durations):
         start = slot + occupied
+        starts.append(start)
         gain = rng.uniform(3.0, 8.0)
         levels[start] += gain
         if duration == 2:
             levels[start + 1] += gain * rng.uniform(0.45, 0.85)
         occupied += duration
+    return tuple(starts)
 
 
 def vary_spectrum(a, target_delta, peak_gain, rng, endpoints, band_weights, reference):
@@ -290,11 +295,14 @@ def simulate(config, rng=None, spectrum=None):
         # The example has a wider central LAeq spread than the general profile.
         relative = [level * 1.55 for level in relative]
     regular = relative.copy() if config.variable_spectrum else ()
+    peak_starts = ()
     if config.event_count:
         if config.natural_peaks:
-            add_natural_peaks(relative, config.event_count, rng)
+            peak_starts = add_natural_peaks(relative, config.event_count, rng)
         else:
-            add_peak_events(relative, config.event_count, config.event_seconds, minimum_gain, config.event_gain, rng)
+            peak_starts = add_peak_events(
+                relative, config.event_count, config.event_seconds, minimum_gain, config.event_gain, rng,
+            )
     normalization = 10 * log10(sum(map(energy, relative)) / config.seconds)
     a = tuple(round(100 * (config.a + level - normalization)) for level in relative)
     endpoints = spectral_endpoints(extended=True, reference=config.reference_spectrum)
@@ -319,7 +327,7 @@ def simulate(config, rng=None, spectrum=None):
     if lower_level < minimum * 100 or max(max(a), max(c)) >= upper_peak * 100:
         raise ValueError("Senaryodaki seviyeler seçili cihaz aralığına sığmıyor. Seviyeleri veya aralığı düzenle.")
     offsets, z = spectrum_offsets(spectrum, band_weights)
-    return Simulation(a, c, offsets, z, spectral_rows, band_average, average_z)
+    return Simulation(a, c, offsets, z, spectral_rows, band_average, average_z, peak_starts)
 
 
 def words(values):
@@ -641,7 +649,7 @@ def measurement_form(st):
     maximum_peaks = field(
         st.number_input, "maximum_peaks", "Saniyelik grafikte maksimum yükseliş sayısı", previous_count,
         min_value=0, step=1,
-        help="Her kaynak açık kaydında sayı sıfır ile bu sınır arasında seçilir. "
+        help="Ölçüm Yap’a bastığında her kaynak açık kaydı için sayı sıfır ile bu sınır arasında ayrı seçilir. "
              "Yükselişler yaklaşık 3–8 dB olur. Çoğu 1 saniye sürer. "
              "Cihazın anlık Lpeak değeri ayrı bir ölçüdür.",
     )
@@ -827,6 +835,15 @@ def show_results(st):
     title, rows, site_notes = result
     section(st, "Simülasyon sonuçları")
     st.write(title)
+    workspace = st.session_state.noise_workspace
+    saved_inputs = (workspace.get("run") or {}).get("inputs", {})
+    saved_maximum = saved_inputs.get("maximum_peaks")
+    draft_maximum = workspace["draft"].get("maximum_peaks", saved_maximum)
+    if draft_maximum != saved_maximum:
+        st.info("Pik sınırını değiştirdin. Ekranda önceki sonuç var. Yeni sınırı uygulamak için Ölçüm Yap’a bas.")
+    if saved_maximum is not None:
+        applied_maximum = min(saved_maximum, (rows[0][2].seconds - 1) // 2)
+        st.caption(f"Bu çalışmada kaynak açık kayıt başına seçim aralığı 0–{applied_maximum} yükseliş.")
     if site_notes:
         st.caption(site_notes)
     if len(rows) > 1:
@@ -836,7 +853,7 @@ def show_results(st):
                  "Bitiş": (config.start + timedelta(seconds=config.seconds)).strftime("%d.%m.%Y %H:%M:%S"),
                  "LAeq (dB(A))": average_centi(data.a) / 100,
                  "LCeq (dB(C))": average_centi(data.c) / 100,
-                 "Grafikteki yükseliş sayısı": config.event_count,
+                 "Grafikte işaretli yükseliş": len(data.peak_starts),
                  "LCeq − LAeq (dB)": (average_centi(data.c) - average_centi(data.a)) / 100}
                 for label, _, config, data, _ in rows
             ], hide_index=True)
@@ -849,13 +866,8 @@ def show_results(st):
     cols[0].metric("LAeq · dB(A)", f"{average_centi(data.a) / 100:.2f}".replace(".", ","))
     cols[1].metric("LCeq · dB(C)", f"{average_centi(data.c) / 100:.2f}".replace(".", ","))
     st.caption(f"{config.start:%d.%m.%Y %H:%M:%S} · {config.seconds // 60} dk · "
-               f"{len(data.a)} kayıt · {config.event_count} yükseliş olayı")
-    st.line_chart(
-        {"Saniye": list(range(1, len(data.a) + 1)),
-         "LAeq · dB(A)": [a / 100 for a in data.a],
-         "LCeq · dB(C)": [c / 100 for c in data.c]},
-        x="Saniye", y=["LAeq · dB(A)", "LCeq · dB(C)"], y_label="Seviye (dB)",
-    )
+               f"{len(data.a)} kayıt · {len(data.peak_starts)} işaretli yükseliş")
+    show_noise_chart(st, data)
     with st.expander(f"Ortalama ⅓ oktav spektrumu · {config.spectrum_filter} filtresi"):
         spectrum = {
             "Hz": [f"{frequency:g}" for frequency in FREQUENCIES],
@@ -874,6 +886,48 @@ def show_results(st):
                            "SIMULASYON_SVL.zip", "application/zip",
                            use_container_width=True, on_click="ignore")
     st.caption("Simülasyon verisi · Eğitim ve yazılım testi")
+
+
+def show_noise_chart(st, data):
+    peak_starts = set(data.peak_starts)
+    series = [
+        {"Saniye": index + 1, "LAeq": a / 100, "LCeq": c / 100, "yukselis": index in peak_starts}
+        for index, (a, c) in enumerate(zip(data.a, data.c))
+    ]
+    st.vega_lite_chart(
+        series,
+        {
+            "height": 300,
+            "encoding": {"x": {"field": "Saniye", "type": "quantitative"}},
+            "layer": [
+                {
+                    "transform": [{"fold": ["LAeq", "LCeq"], "as": ["Profil", "Seviye"]}],
+                    "mark": {"type": "line", "tooltip": True},
+                    "encoding": {
+                        "y": {"field": "Seviye", "type": "quantitative", "title": "Seviye (dB)",
+                              "scale": {"zero": False}},
+                        "color": {"field": "Profil", "type": "nominal", "legend": {"orient": "bottom"}},
+                    },
+                },
+                {
+                    "transform": [{"filter": "datum.yukselis"}],
+                    "mark": {"type": "point", "shape": "triangle-up", "filled": True,
+                             "color": "#f59e0b", "size": 95},
+                    "encoding": {
+                        "y": {"field": "LAeq", "type": "quantitative", "title": "Seviye (dB)",
+                              "scale": {"zero": False}},
+                        "tooltip": [
+                            {"field": "Saniye", "type": "quantitative", "title": "Yükseliş başlangıcı (sn)"},
+                            {"field": "LAeq", "type": "quantitative", "title": "LAeq (dB(A))", "format": ".2f"},
+                        ],
+                    },
+                },
+            ],
+        },
+        width="stretch",
+    )
+    if peak_starts:
+        st.caption("Sarı üçgenler simülasyondaki yükselişlerin başladığı saniyeleri gösterir.")
 
 
 WORKSPACE_STORAGE = """
