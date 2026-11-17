@@ -310,8 +310,8 @@ def measurement_form(st):
         st.caption("Her geçiş süresi, önceki noktadaki son kayıt bittiğinde başlar.")
         for number in range(2, point_count + 1):
             transition = st.number_input(
-                f"{number - 1}. → {number}. nokta arası (sn)",
-                min_value=0, value=0, step=2, key=f"point_transition_{number}",
+                f"Nokta {number - 1} → {number} geçiş süresi (sn)",
+                min_value=0, value=0, step=1, key=f"point_transition_{number}",
             )
             following_points.append((f"{plant}{number}", transition))
     setting = st.selectbox("Ortam", ("Dış ortam", "İç ortam"))
@@ -347,9 +347,8 @@ def measurement_form(st):
         st.warning(f"Seçilen saha planında önerilen süre {recommended} dk. Simülasyon oluşturulabilir.")
     repeats = st.number_input("Cihaz tekrar sayısı", 1, 10, 1)
     gap_seconds = st.number_input(
-        "Aynı noktadaki ölçümler arası bekleme (sn)", min_value=0, value=0, step=2,
-        help="Aynı noktadaki tekrarlar ve arka plan kaydı için kullanılır. "
-             "SVL zamanları 2 saniye çözünürlüklüdür.",
+        "Aynı noktadaki ölçümler arası bekleme (sn)", min_value=0, value=0, step=1,
+        help="Aynı noktadaki tekrarlar ve arka plan kaydı için kullanılır.",
     )
 
     section(st, "Kayıt ve ses seviyesi")
@@ -372,7 +371,14 @@ def measurement_form(st):
         c = st.number_input("Hedef LCeq [dB(C)]", -10.0, 145.0, min(145.0, a + 7.0), 0.1) if manual_c else a + 7.0
         has_background = st.checkbox("Kaynak kapalıyken arka plan kaydı ekle")
         background = st.number_input("Arka plan hedef LAeq [dB(A)]", 25.0, 139.0, 45.0, 0.1) if has_background else None
-        high_range = st.selectbox("Cihaz aralığı", ("Düşük", "Yüksek")) == "Yüksek"
+        high_range = st.selectbox(
+            "Cihaz aralığı",
+            (False, True),
+            format_func=lambda high: "Yüksek · 30 dB(A) Leq / 140 dB Peak"
+            if high else "Düşük · 25 dB(A) Leq / 123 dB Peak",
+            help="SVAN 971’in alt Leq sınırı ve üst anlık tepe sınırı. "
+                 "Yüksek aralık, daha yüksek tepelere yer açar.",
+        )
         delay = st.number_input("Başlangıç gecikmesi (sn)", 0, 60, 3,
                                 help="Cihaz ayarı olarak kaydedilir. Formdaki başlangıç, kaydın ilk zamanıdır.")
         st.caption("Kayıt adımı 1 sn · ⅓ oktav · Başlangıç senkronizasyonu kapalı")
@@ -391,20 +397,19 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
-    if gap_seconds < 0 or gap_seconds % 2:
-        raise ValueError("Ölçümler arası bekleme için 0 veya 2'nin katı olan bir saniye değeri gir.")
+    if gap_seconds < 0:
+        raise ValueError("Ölçümler arası bekleme süresi negatif olamaz.")
     points = [(point.strip(), 0)]
     for number, (next_point, transition) in enumerate(following_points, start=2):
         if not next_point.strip():
             raise ValueError(f"{number}. noktanın adını gir.")
-        if transition < 0 or transition % 2:
-            raise ValueError(f"{number - 1}. → {number}. nokta arası süre 0 veya 2'nin katı olmalı.")
+        if transition < 0:
+            raise ValueError(f"Nokta {number - 1} → {number} geçiş süresi negatif olamaz.")
         points.append((next_point.strip(), transition))
     multi_point = len(points) > 1
     plant = plant.strip()
     title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
     next_start = datetime.combine(day, clock)
-    next_start -= timedelta(seconds=next_start.second % 2, microseconds=next_start.microsecond)
     duration = timedelta(minutes=minutes)
     record_interval = duration + timedelta(seconds=gap_seconds)
     rows = []
@@ -450,6 +455,8 @@ def show_results(st):
                  "Bitiş": (config.start + timedelta(seconds=config.seconds)).strftime("%d.%m.%Y %H:%M:%S")}
                 for label, _, config, _, _ in rows
             ], hide_index=True)
+    if any(config.start.second % 2 for _, _, config, _, _ in rows):
+        st.caption("Çizelge tam başlangıç saatlerini gösterir. SVL başlığı tek saniyeleri önceki çift saniyeye yazar.")
     selection = st.selectbox("Kayıt", range(len(rows)), format_func=lambda index: rows[index][0])
     label, filename, config, data, file_bytes = rows[selection]
     cols = st.columns(2)
