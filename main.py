@@ -6,11 +6,11 @@ from zoneinfo import ZoneInfo
 from html import escape
 from io import BytesIO
 import json
-from math import ceil, floor, isfinite, log10, log2
+from math import ceil, exp, floor, isfinite, log10, log2
 from random import Random
 import re
 from secrets import token_hex
-from struct import pack
+from struct import iter_unpack, pack
 from unicodedata import normalize
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -38,6 +38,8 @@ REFERENCE_A_BANDS = (
 PERIODS = ("Türkiye Ek-2 – 5 dk referans", "ISO 1996-2 – elverişli veya geometri koşulu", "ISO 1996-2 – diğer koşullar")
 DEFAULT_POINT_VARIATION_DB = 5.0
 UNAVAILABLE = 0xD000
+STAT_LEVELS = (1, 10, 20, 30, 40, 50, 60, 70, 80, 90)
+STAT_CLASSES = 120
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class Measurement:
     variable_spectrum: bool = False
     spectrum_filter: str = "Z"
     reference_spectrum: bool = False
+    detailed_svl: bool = False
 
 
 @dataclass(frozen=True)
@@ -355,8 +358,106 @@ def slug(value):
     return re.sub(r"[^A-Z0-9_-]", "", value)[:28]
 
 
-def profile_settings():
-    return [0x1405, 0x0307, 0x0606, 1, 2, 8, 2, 0, 0x0606, 1, 3, 8, 3, 0, 0x0606, 0, 2, 8, 2, 0]
+def profile_settings(detailed):
+    mask = 15 if detailed else 8
+    return [0x1405, 0x0307, 0x0606, 1, 2, mask, 2, 0, 0x0606, 1, 3, mask, 3, 0, 0x0606, 0, 2, mask, 2, 0]
+
+
+def centi_level(power):
+    return max(0, round(1000 * log10(power)))
+
+
+def statistical_level(histogram, bottom, exceeded):
+    rank = sum(histogram) * (1 - exceeded / 100)
+    before = 0
+    for index, count in enumerate(histogram):
+        if count and before + count >= rank:
+            return round(100 * (bottom + index + (rank - before) / count))
+        before += count
+
+
+def period_level(start, series):
+    # SVAN 971 day split 06–18, 18–22, 22–06 (Appendix D).
+    totals, seconds = [0.0] * 3, [0] * 3
+    first_second = start.hour * 3600 + start.minute * 60 + start.second
+    for index, level in enumerate(series):
+        hour = ((first_second + index) // 3600) % 24
+        period = 0 if 6 <= hour < 18 else 1 if 18 <= hour < 22 else 2
+        totals[period] += energy(level / 100)
+        seconds[period] += 1
+    active = [(index, count) for index, count in enumerate(seconds) if count]
+    weights, penalties = (12, 4, 8), (1, energy(5), energy(10))
+    combined = sum(weights[i] * penalties[i] * totals[i] / n for i, n in active)
+    return centi_level(combined / sum(weights[i] for i, _ in active)), sum(1 << i for i, _ in active) << 5
+
+
+def detailed_logger(config, samples, series):
+    signals = tuple(zip(*series))
+    rng = Random(f"{config.start.isoformat()}|{config.name}")
+    bottom = min(18 if config.high_range else 13, max(0, min(min(s) for s in series) // 100 - 4))
+    bottom = max(bottom, ceil(max(max(s) for s in series) / 100) - STAT_CLASSES + 12)
+    histograms = [[0] * STAT_CLASSES for _ in series]
+    current = [energy(level / 100) for level in signals[0]]
+    detector = tuple(1 - exp(-0.1 / constant) for constant in (0.125, 0.035, 1.5))
+    fast, attack, release = detector
+    history = [[] for _ in series]
+    band_extrema = [[65535] * 34, [0] * 34, [0] * 34]
+    payload = bytearray()
+    overload_seconds = 0
+    overload_threshold = (14050 if config.high_range else 12350)
+    for row, levels in zip(iter_unpack("<38H", samples), signals):
+        modulation = [energy(rng.uniform(-3, 3)) for _ in range(10)]
+        normalizer = sum(modulation) / len(modulation)
+        factors = [value / normalizer for value in modulation]
+        # Use a synthetic crest factor inside each subsecond window.
+        crest = [rng.uniform(4, 11) for _ in factors]
+        low = round(1000 * log10(min(factors)))
+        high = round(1000 * log10(max(factors)))
+        peak = round(max(1000 * log10(factor) + 100 * db for factor, db in zip(factors, crest)))
+        overload = max(levels) + peak > overload_threshold
+        overload_seconds += overload
+        payload += words([row[0] | int(overload)])
+        for profile, leq in enumerate(levels):
+            power = energy(leq / 100)
+            state = current[profile]
+            low_power, high_power = float("inf"), 0.0
+            for factor in factors:
+                sample = power * factor
+                alpha = fast if profile < 2 else attack if sample > state else release
+                state += alpha * (sample - state)
+                low_power = min(low_power, state)
+                high_power = max(high_power, state)
+                category = floor(log10(sample) * 10) - bottom
+                histograms[profile][max(0, min(STAT_CLASSES - 1, category))] += 1
+            current[profile] = state
+            result = leq + peak, centi_level(high_power), centi_level(low_power)
+            history[profile].append(result)
+            payload += words([*result, leq])
+        payload += words(row[4:])
+        for index, level in enumerate(row[4:]):
+            band_extrema[0][index] = min(band_extrema[0][index], max(0, level + low))
+            band_extrema[1][index] = max(band_extrema[1][index], level + high)
+            band_extrema[2][index] = max(band_extrema[2][index], level + peak)
+
+    def takt(maxima, span):
+        return average_centi([max(maxima[i:i + span]) for i in range(0, len(maxima), span)])
+
+    extras = []
+    for profile, readings in enumerate(history):
+        peaks, maxima, minima = zip(*readings)
+        den, flags = period_level(config.start, series[profile])
+        extras.append((max(peaks), max(maxima), min(minima), centi_level(current[profile]),
+                       den, takt(maxima, 3), takt(maxima, 5), flags))
+    ln = [0x2B17, 0x0307, len(STAT_LEVELS)]
+    for exceeded in STAT_LEVELS:
+        ln.extend([exceeded, *(statistical_level(hist, bottom, exceeded) for hist in histograms)])
+    histogram = []
+    for profile, counts in enumerate(histograms):
+        histogram.extend([(1 << (8 + profile)) | 0x0B, 2 * STAT_CLASSES + 2])
+        for count in counts:
+            histogram.extend((count & 0xFFFF, count >> 16))
+    stat_header = words([0x0E09, 0x0307, *([0x040A, STAT_CLASSES, bottom * 10, 10] * 3)])
+    return payload, extras, band_extrema, stat_header, record(ln), record(histogram), overload_seconds
 
 
 def svl(config, data, title):
@@ -404,27 +505,44 @@ def svl(config, data, title):
             bands = [max(0, a + offset) for offset in data.spectrum_offsets]
             samples += words([0, a, c, a, *bands, a, c, a + data.z_offset])
 
+    profiles = (data.a, data.c, data.a)
+    stat_header, stat_levels, histogram = b"", b"", b""
+    band_extrema = []
+    overload = 0
+    details = [(UNAVAILABLE,) * 4 + (0,) * 4] * len(profiles)
+    if config.detailed_svl:
+        samples, details, band_extrema, stat_header, stat_levels, histogram, overload = detailed_logger(
+            config, samples, profiles,
+        )
+        general[6] = 2 if overload else 0
+        general[31] = 127  # main results, four spectrum blocks, levels and histograms
+
     main_results = [0x4407, 0x0307]
-    for profile, series in enumerate((data.a, data.c, data.a)):
+    for profile, (series, detail) in enumerate(zip(profiles, details)):
         leq = average_centi(series)
+        peak, maximum, minimum, spl, den, takt3, takt5, flags = detail
+        # The second profile's time slot carries the overload duration.
+        elapsed = (config.seconds, overload, 0)[profile]
         main_results.extend([
-            0x1608, config.seconds if profile == 0 else 0, 0,
-            UNAVAILABLE, round(leq + 1000 * log10(config.seconds)),
-            UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, leq, *([0] * 11),
+            0x1608, elapsed, 0, peak, round(leq + 1000 * log10(config.seconds)),
+            maximum, minimum, spl, leq, den, takt3, takt5, *([0] * 7),
+            flags | (2 if overload else 0),
             UNAVAILABLE, UNAVAILABLE,
         ])
     spectrum = [0x2710, 0x0101, 2000, 31, 3]
     spectrum += average_bands(data)
     total_z = data.average_z if data.average_z is not None else average_centi(data.a) + data.z_offset
     spectrum += [average_centi(data.a), average_centi(data.c), total_z]
-    summary = record([0x0359, 2, 0]) + record(main_results) + record(spectrum)
+    for tag, spectrum_extreme in zip((0x2728, 0x2729, 0x2732), band_extrema):
+        spectrum.extend([tag, 0x0101, 2000, 31, 3, *spectrum_extreme])
+    summary = record([0x0359, 2, 0]) + record(main_results) + stat_levels + record(spectrum) + histogram
     logger_size = len(samples) + len(summary)
     logger = words([0x0E0F, 1, 0, 2000, 31, 3]) + pack(
         "<IIII", logger_size, config.seconds, config.seconds, 0
     )
     return b"".join((
         pc_header, file_header, unit, calibration, user_text, words(general), words(triggers),
-        words(profile_settings()), words(display), logger, samples, summary,
+        words(profile_settings(config.detailed_svl)), words(display), stat_header, logger, samples, summary,
     ))
 
 
@@ -695,7 +813,7 @@ def measurement_form(st):
         minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=0,
         length=1, gain=8.0, background=background, high_range=high_range, delay=delay,
         maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
-        spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum,
+        spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum, detailed_svl=True,
         gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
     )
@@ -750,7 +868,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   min_gain=None, gap_seconds=0, following_points=(), seed=None,
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
-                  reference_spectrum=False):
+                  reference_spectrum=False, detailed_svl=False):
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
@@ -816,7 +934,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                                  length, gain, delay, high_range, event_min_gain=min_gain,
                                  natural_peaks=peak_limit is not None, variable_baseline=variable_baseline,
                                  variable_spectrum=variable_spectrum, spectrum_filter=spectrum_filter,
-                                 reference_spectrum=reference_spectrum and not is_background)
+                                 reference_spectrum=reference_spectrum and not is_background,
+                                 detailed_svl=detailed_svl)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
