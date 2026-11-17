@@ -661,14 +661,19 @@ def render_workspace(st):
     saved_run = st.session_state.noise_workspace.get("run")
     previous_limit = saved_run["inputs"].get("maximum_peaks") if saved_run else None
     limit_changed = saved_run is not None and previous_limit != inputs["maximum_peaks"]
-    if st.button("Ölçüm Yap", type="primary", use_container_width=True) or limit_changed:
+    filter_changed = saved_run is not None and (
+        saved_run["inputs"].get("spectrum_filter", "Z") != inputs["spectrum_filter"]
+    )
+    if st.button("Ölçüm Yap", type="primary", use_container_width=True) or limit_changed or filter_changed:
         try:
             seed = token_hex(16)
             st.session_state.results = build_results(**inputs, seed=seed)
             st.session_state.noise_workspace["run"] = {"inputs": inputs, "seed": seed}
             draft.pop("selected_record", None)
             st.session_state.pop("noise_field_selected_record", None)
-            if limit_changed:
+            if filter_changed:
+                st.success(f"{inputs['spectrum_filter']} spektrum filtresi uygulandı. Noktaların sonuçları yenilendi.")
+            elif limit_changed:
                 st.success(f"Pik üst sınırı {inputs['maximum_peaks']} uygulandı. Noktaların sonuçları yenilendi.")
         except ValueError as error:
             st.error(str(error))
@@ -824,7 +829,8 @@ def measurement_form(st):
         spectrum_filter = field(
             st.selectbox, "spectrum_filter", "⅓ oktav spektrum filtresi", "Z", options=("Z", "A"),
             format_func=lambda weighting: "A · A ağırlıklı" if weighting == "A" else "Z · Ağırlıksız",
-            help="Bant grafiğine ve SVL’deki ⅓ oktav bantlarına uygulanır.",
+            help="Bant grafiğine ve SVL’deki ⅓ oktav bantlarına uygulanır. "
+                 "Sonuç varken filtreyi değiştirirsen sonuçlar otomatik yenilenir.",
         )
         reference_spectrum = field(
             st.checkbox, "reference_spectrum", "CVKALI22 örneğine benzer frekans dağılımı", False,
@@ -993,6 +999,10 @@ def show_results(st):
     saved_inputs = (workspace.get("run") or {}).get("inputs", {})
     saved_maximum = saved_inputs.get("maximum_peaks")
     draft_maximum = workspace["draft"].get("maximum_peaks", saved_maximum)
+    applied_filter = rows[0][2].spectrum_filter
+    if workspace["draft"].get("spectrum_filter", applied_filter) != applied_filter:
+        st.info("Spektrum filtresi değişti. Ölçüm oluştur ekranında yeni sonuçları oluştur.")
+        return
     if draft_maximum != saved_maximum:
         st.info("Pik sınırı değişti. Ölçüm oluştur ekranında yeni sonuçları oluştur.")
         return
