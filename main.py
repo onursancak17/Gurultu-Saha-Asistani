@@ -48,6 +48,7 @@ class Measurement:
     delay: int = 3
     high_range: bool = False
     event_min_gain: float | None = None
+    natural_peaks: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,26 @@ def add_peak_events(levels, count, duration, minimum_gain, maximum_gain, rng):
             levels[index] += gain
 
 
+def add_natural_peaks(levels, count, rng):
+    # Reserve a normal sample before, after and between events.
+    spare_seconds = len(levels) - 2 * count - 1
+    durations = []
+    for _ in range(count):
+        duration = 2 if spare_seconds > 0 and rng.random() < 0.2 else 1
+        durations.append(duration)
+        spare_seconds -= duration - 1
+    free_seconds = len(levels) - sum(durations)
+    slots = sorted(rng.sample(range(1, free_seconds), count))
+    occupied = 0
+    for slot, duration in zip(slots, durations):
+        start = slot + occupied
+        gain = rng.uniform(3.0, 8.0)
+        levels[start] += gain
+        if duration == 2:
+            levels[start + 1] += gain * rng.uniform(0.45, 0.85)
+        occupied += duration
+
+
 def simulate(config, rng=None, spectrum=None):
     if not 1 <= config.seconds <= 3600:
         raise ValueError("Bir kayıt 1 ile 3600 saniye arasında olmalı.")
@@ -151,7 +172,7 @@ def simulate(config, rng=None, spectrum=None):
         minimum_gain = min(10.0, config.event_gain)
     if config.event_count < 0 or config.event_seconds < 1 or not 0 < minimum_gain <= config.event_gain <= 40:
         raise ValueError("Pik sayısını, süresini ve dB aralığını kontrol et. Alt sınır üst sınırı aşamaz.")
-    occupied = config.event_count * config.event_seconds
+    occupied = config.event_count * (1 if config.natural_peaks else config.event_seconds)
     free = config.seconds - occupied
     if config.event_count and free < config.event_count + 1:
         raise ValueError("Pikler arasında ve kaydın iki ucunda en az birer normal saniye bırakılmalı.")
@@ -159,7 +180,10 @@ def simulate(config, rng=None, spectrum=None):
     rng = rng if rng is not None else Random()
     relative = normal_profile(config.seconds, rng)
     if config.event_count:
-        add_peak_events(relative, config.event_count, config.event_seconds, minimum_gain, config.event_gain, rng)
+        if config.natural_peaks:
+            add_natural_peaks(relative, config.event_count, rng)
+        else:
+            add_peak_events(relative, config.event_count, config.event_seconds, minimum_gain, config.event_gain, rng)
     normalization = 10 * log10(sum(map(energy, relative)) / config.seconds)
     a = tuple(round(100 * (config.a + level - normalization)) for level in relative)
     if spectrum is None:
@@ -485,19 +509,13 @@ def measurement_form(st):
             manual_c = field(st.number_input, f"point_c_{number}", f"{plant}{number} · Nihai LCeq [dB(C)]",
                              min_value=-10.0, max_value=145.0, step=0.01, placeholder="Otomatik")
             manual_targets.append((number, manual_a, manual_c))
-    character = field(st.radio, "character", "Ses karakteri", "Kararlı", options=("Kararlı", "Pikli"), horizontal=True)
-    count = 0
-    length = 2
-    min_gain, gain = 10.0, 25.0
-    if character == "Pikli":
-        count = field(st.number_input, "peak_count", "Pik sayısı", 3, min_value=1, max_value=200)
-        length = field(st.number_input, "peak_length", "Her pikin süresi (sn)", 2, min_value=1, max_value=120)
-        low_col, high_col = st.columns(2)
-        min_gain = field(low_col.number_input, "min_gain", "En düşük pik artışı (dB)", 10.0,
-                         min_value=1.0, max_value=40.0, step=0.5)
-        gain = field(high_col.number_input, "gain", "En yüksek pik artışı (dB)", 25.0,
-                     min_value=1.0, max_value=40.0, step=0.5)
-        st.caption("Artışlar o andaki normal seviyeye eklenir. Pikler dâhil tüm kayıt hedef LAeq’ye ayarlanır.")
+    draft = st.session_state.noise_workspace["draft"]
+    previous_count = draft.get("peak_count", 0) if draft.get("character") == "Pikli" else 0
+    maximum_peaks = field(
+        st.number_input, "maximum_peaks", "Ölçüm başına maksimum pik sayısı", previous_count, min_value=0, step=1,
+        help="Her kaynak açık kaydında sayı sıfır ile bu sınır arasında seçilir. "
+             "Pik artışları yaklaşık 3–8 dB olur. Çoğu 1 saniye sürer, bazıları 2 saniyede söner.",
+    )
 
     with st.expander("Arka plan ve cihaz ayarları"):
         manual_c = field(st.checkbox, "manual_c", "Genel LCeq referansı belirle", False)
@@ -527,9 +545,9 @@ def measurement_form(st):
     return dict(
         plant=plant, point=point, setting=setting, mode=mode, day=day, clock=clock,
         site_notes=site_notes,
-        minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=count,
-        length=length, gain=gain, background=background, high_range=high_range, delay=delay,
-        min_gain=min_gain, gap_seconds=gap_seconds, following_points=following_points,
+        minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=0,
+        length=1, gain=8.0, background=background, high_range=high_range, delay=delay,
+        maximum_peaks=maximum_peaks, gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
     )
 
@@ -581,7 +599,7 @@ def repeat_offsets(repeats, margin, rng):
 def build_results(plant, point, setting, mode, day, clock, minutes, repeats, name,
                   a, c, count, length, gain, background, high_range, delay, site_notes="",
                   min_gain=None, gap_seconds=0, following_points=(), seed=None,
-                  a_bounds=None, c_bounds=None, manual_targets=()):
+                  a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None):
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
@@ -606,6 +624,9 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
     next_start = datetime.combine(day, clock)
     duration = timedelta(minutes=minutes)
+    if maximum_peaks is not None and maximum_peaks < 0:
+        raise ValueError("Maksimum pik sayısı negatif olamaz.")
+    peak_limit = min(maximum_peaks, (minutes * 60 - 1) // 2) if maximum_peaks is not None else None
     record_interval = duration + timedelta(seconds=gap_seconds)
     rows = []
     rng = Random(seed)
@@ -636,9 +657,13 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                 device_id = record_name[:max(1, 5 - len(suffix))] + suffix
             level_a = background if is_background else point_a + shifts[index]
             level_c = background + 7.0 if is_background else point_c + shifts[index]
+            event_count = 0 if is_background else count
+            if not is_background and peak_limit is not None:
+                event_count = rng.randint(0, peak_limit) if peak_limit else 0
             config = Measurement(device_id, next_start + record_interval * index,
-                                 minutes * 60, level_a, level_c, 0 if is_background else count,
-                                 length, gain, delay, high_range, event_min_gain=min_gain)
+                                 minutes * 60, level_a, level_c, event_count,
+                                 length, gain, delay, high_range, event_min_gain=min_gain,
+                                 natural_peaks=peak_limit is not None)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
@@ -666,6 +691,7 @@ def show_results(st):
                  "Bitiş": (config.start + timedelta(seconds=config.seconds)).strftime("%d.%m.%Y %H:%M:%S"),
                  "LAeq (dB(A))": average_centi(data.a) / 100,
                  "LCeq (dB(C))": average_centi(data.c) / 100,
+                 "Pik olayı": config.event_count,
                  "LCeq − LAeq (dB)": (average_centi(data.c) - average_centi(data.a)) / 100}
                 for label, _, config, data, _ in rows
             ], hide_index=True)
