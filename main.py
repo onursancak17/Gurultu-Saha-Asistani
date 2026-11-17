@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from html import escape
 from io import BytesIO
-from math import cos, isfinite, log10, log2, sin
+from math import isfinite, log10, log2
+from random import Random
 import re
 from struct import pack
 from unicodedata import normalize
@@ -39,9 +40,10 @@ class Measurement:
     c: float
     event_count: int = 0
     event_seconds: int = 2
-    event_gain: float = 8.0
+    event_gain: float = 25.0
     delay: int = 3
     high_range: bool = False
+    event_min_gain: float | None = None
 
 
 @dataclass(frozen=True)
@@ -82,28 +84,69 @@ def spectrum_offsets(c_minus_a):
     return tuple(round(1000 * log10(value)) for value in bins), round(1000 * log10(sum(bins)))
 
 
-def simulate(config):
+def normal_profile(seconds, rng):
+    # Interpolate between independent levels at irregular intervals, with
+    # smaller second-to-second variation on top of the slower changes.
+    levels = []
+    previous = rng.uniform(-3.2, 3.2)
+    while len(levels) < seconds:
+        span = min(rng.randint(3, 15), seconds - len(levels))
+        next_level = rng.uniform(-3.2, 3.2)
+        levels.extend(
+            previous + (next_level - previous) * (index + 1) / span
+            + rng.uniform(-0.45, 0.45)
+            for index in range(span)
+        )
+        previous = next_level
+    return levels
+
+
+def add_peak_events(levels, count, duration, minimum_gain, maximum_gain, rng):
+    # Sampling on the shortened timeline leaves a normal second between
+    # events and at both ends after each full event is inserted.
+    free_seconds = len(levels) - count * duration
+    slots = sorted(rng.sample(range(1, free_seconds), count))
+    starts = [slot + index * duration for index, slot in enumerate(slots)]
+    event_energies = [
+        sum(energy(level) for level in levels[start : start + duration])
+        for start in starts
+    ]
+    minimum_factor = energy(minimum_gain)
+    factors = [energy(rng.uniform(minimum_gain, maximum_gain)) for _ in starts]
+    ordinary_energy = sum(map(energy, levels))
+    minimum_total = ordinary_energy + sum(event_energies) * (minimum_factor - 1)
+    extra_energy = sum(
+        base * (factor - minimum_factor) for base, factor in zip(event_energies, factors)
+    )
+    # Prefer a modest LAeq correction for the normal intervals. Large or
+    # frequent peaks may require a lower baseline even at the minimum gain.
+    budget = max(ordinary_energy * energy(1.5), minimum_total * energy(0.4))
+    scale = min(1.0, (budget - minimum_total) / extra_energy) if extra_energy else 1.0
+    for start, factor in zip(starts, factors):
+        gain = 10 * log10(minimum_factor + scale * (factor - minimum_factor))
+        for index in range(start, start + duration):
+            levels[index] += gain
+
+
+def simulate(config, rng=None):
     if not 1 <= config.seconds <= 3600:
         raise ValueError("Bir kayıt 1 ile 3600 saniye arasında olmalı.")
     if not isfinite(config.a) or not isfinite(config.c):
         raise ValueError("LAeq ve LCeq sonlu sayı olmalı.")
-    if config.event_count < 0 or config.event_seconds < 1 or not 0 < config.event_gain <= 40:
-        raise ValueError("Pik sayısını, süresini ve seviyesini kontrol et.")
+    minimum_gain = config.event_min_gain
+    if minimum_gain is None:
+        minimum_gain = min(10.0, config.event_gain)
+    if config.event_count < 0 or config.event_seconds < 1 or not 0 < minimum_gain <= config.event_gain <= 40:
+        raise ValueError("Pik sayısını, süresini ve dB aralığını kontrol et. Alt sınır üst sınırı aşamaz.")
     occupied = config.event_count * config.event_seconds
     free = config.seconds - occupied
     if config.event_count and free < config.event_count + 1:
         raise ValueError("Pikler arasında ve kaydın iki ucunda en az birer normal saniye bırakılmalı.")
 
-    # Distribute complete events with a normal interval between each event.
-    events = [False] * config.seconds
-    for index in range(config.event_count):
-        start = (index + 1) * free // (config.event_count + 1) + index * config.event_seconds
-        events[start : start + config.event_seconds] = [True] * config.event_seconds
-    relative = [
-        0.31 * sin(index / 5.7) + 0.19 * cos(index / 11.1)
-        + (config.event_gain if active else 0)
-        for index, active in enumerate(events)
-    ]
+    rng = rng if rng is not None else Random()
+    relative = normal_profile(config.seconds, rng)
+    if config.event_count:
+        add_peak_events(relative, config.event_count, config.event_seconds, minimum_gain, config.event_gain, rng)
     normalization = 10 * log10(sum(map(energy, relative)) / config.seconds)
     a = tuple(round(100 * (config.a + level - normalization)) for level in relative)
     c = tuple(level + round(100 * (config.c - config.a)) for level in a)
@@ -300,11 +343,14 @@ def measurement_form(st):
     character = st.radio("Ses karakteri", ("Kararlı", "Pikli"), horizontal=True)
     count = 0
     length = 2
-    gain = 8.0
+    min_gain, gain = 10.0, 25.0
     if character == "Pikli":
         count = st.number_input("Pik sayısı", 1, 200, 3)
         length = st.number_input("Her pikin süresi (sn)", 1, 120, 2)
-        gain = st.number_input("Pikin normal seviyeden farkı (dB)", 1.0, 40.0, 8.0, 0.5)
+        low_col, high_col = st.columns(2)
+        min_gain = low_col.number_input("En düşük pik artışı (dB)", 1.0, 40.0, 10.0, 0.5)
+        gain = high_col.number_input("En yüksek pik artışı (dB)", 1.0, 40.0, 25.0, 0.5)
+        st.caption("Artışlar o andaki normal seviyeye eklenir. Pikler dâhil tüm kayıt hedef LAeq’ye ayarlanır.")
 
     with st.expander("Arka plan ve cihaz ayarları"):
         manual_c = st.checkbox("Hedef LCeq’yi manuel belirle")
@@ -320,11 +366,12 @@ def measurement_form(st):
         site_notes=site_notes,
         minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=count,
         length=length, gain=gain, background=background, high_range=high_range, delay=delay,
+        min_gain=min_gain,
     )
 
 
 def build_results(plant, point, setting, mode, day, clock, minutes, repeats, name,
-                  a, c, count, length, gain, background, high_range, delay, site_notes=""):
+                  a, c, count, length, gain, background, high_range, delay, site_notes="", min_gain=None):
     if not plant.strip() or not point.strip() or not slug(name).strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
     title = f"{plant.strip()} / {point.strip()}"
@@ -341,7 +388,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
         level_c = background + 7.0 if is_background else c
         config = Measurement(device_id, start + timedelta(minutes=minutes * index),
                              minutes * 60, level_a, level_c, 0 if is_background else count,
-                             length, gain, delay, high_range)
+                             length, gain, delay, high_range, event_min_gain=min_gain)
         data = simulate(config)
         filename = f"SIMULASYON_{slug(name)}_{suffix}.SVL"
         rows.append((label, filename, config, data, svl(config, data, metadata + " | " + label)))
