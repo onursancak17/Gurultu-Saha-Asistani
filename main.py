@@ -462,14 +462,12 @@ def detailed_logger(config, samples, series):
     return payload, extras, band_extrema, stat_header, record(ln), record(histogram), overload_seconds
 
 
-def svl(config, data, title):
+def svl(config, data, file_stem=None):
     """Write the SVAN 971 1/3-octave logger format from App. B of the manual."""
     start_date, start_time = encoded_time(config.start)
-    device_filename = ("SIM" + slug(config.name).replace("-", "").replace("_", "")[:5]).encode("ascii")
-    ascii_title = normalize("NFKD", title.replace("ı", "i").replace("İ", "I"))
-    description = ("EGITIM / YAZILIM TESTI | " + ascii_title).encode("ascii", errors="ignore")[:126]
-    # Match the reference format's fixed title block and include a NUL terminator.
-    description = description.ljust(130, b"\0")
+    device_filename = slug(file_stem or config.name)[:8].encode("ascii")
+    # The reference encodes an empty description as a space followed by NUL padding.
+    description = b" ".ljust(130, b"\0")
 
     pc_header = b"SvanPC" + words([26, 32, 71] + [0] * 10)
     file_header = words([0x0E01]) + device_filename.ljust(8, b" ") + words(
@@ -909,9 +907,10 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     record_interval = duration + timedelta(seconds=gap_seconds)
     rows = []
     rng = Random(seed)
+    record_count = len(points) * (repeats + (background is not None))
+    sequence_width = max(2, len(str(record_count)))
     for number, (point_name, transition) in enumerate(points, start=1):
         next_start += timedelta(seconds=transition)
-        metadata = f"{plant} / {point_name} | {setting} | {mode.strip()}"
         point_a, point_c = a, c
         spectrum = None
         shifts = [0.0] * repeats
@@ -951,7 +950,11 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             except ValueError as error:
                 raise ValueError(f"{point_name} · {label} · {error}") from error
             filename = f"SIMULASYON_{record_name}_{suffix}.SVL"
-            rows.append((label, filename, config, data, svl(config, data, metadata + " | " + label)))
+            file_stem = record_name
+            if record_count > 1:
+                sequence = f"{len(rows) + 1:0{sequence_width}d}"
+                file_stem = record_name[:8 - len(sequence)] + sequence
+            rows.append((label, filename, config, data, svl(config, data, file_stem)))
         next_start = config.start + duration
     return title, rows, site_notes
 
