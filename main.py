@@ -710,13 +710,28 @@ def measurement_form(st):
 
     section(st, "Tarih, saat ve süre")
     now = datetime.now(ZoneInfo("Europe/Istanbul"))
+    draft = st.session_state.noise_workspace["draft"]
+    if "clock_hms" not in draft and isinstance(draft.get("clock"), (str, time)):
+        try:
+            old_clock = draft["clock"]
+            if isinstance(old_clock, str):
+                old_clock = time.fromisoformat(old_clock)
+            draft["clock_hms"] = old_clock.replace(
+                second=draft.get("start_second", old_clock.second),
+            ).strftime("%H:%M:%S")
+        except (TypeError, ValueError):
+            pass
     with st.container(key="datetime"):
         date_col, time_col = st.columns(2)
         day = field(date_col.date_input, "day", "Başlangıç tarihi", now.date(), format="DD.MM.YYYY")
-        clock = field(time_col.time_input, "clock", "Başlangıç saati", now.time().replace(second=0, microsecond=0), step=60)
-    start_second = field(st.number_input, "start_second", "Başlangıç saniyesi", 0,
-                         min_value=0, max_value=59, step=1)
-    clock = clock.replace(second=start_second)
+        clock_text = field(
+            time_col.text_input, "clock_hms", "Başlangıç saati (HH:MM:SS)", now.strftime("%H:%M:%S"),
+            placeholder="14:25:22",
+            help="Saat, dakika ve saniyeyi gir. SVL başlığı tek saniyeleri bir önceki çift saniyeye kaydeder.",
+        ).strip()
+    clock = None
+    if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]", clock_text):
+        clock = time.fromisoformat(clock_text)
     default_minutes = (5, 10, 30)[PERIODS.index(period)]
     period_min = field(st.number_input, "period_min", "Kaynağın tam çalışma döngüsü (dk, biliniyorsa)", 0, min_value=0, max_value=60)
     recommended = max(default_minutes, period_min)
@@ -763,7 +778,6 @@ def measurement_form(st):
             manual_c = field(st.number_input, f"point_c_{number}", f"{plant}{number} · Nihai LCeq [dB(C)]",
                              min_value=-10.0, max_value=145.0, step=0.01, placeholder="Otomatik")
             manual_targets.append((number, manual_a, manual_c))
-    draft = st.session_state.noise_workspace["draft"]
     previous_count = draft.get("peak_count", 0) if draft.get("character") == "Pikli" else 0
     maximum_peaks = field(
         st.number_input, "maximum_peaks", "Saniyelik grafikte maksimum yükseliş sayısı", previous_count,
@@ -875,6 +889,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
                   reference_spectrum=False, detailed_svl=False, device_serial=None):
+    if not isinstance(clock, time):
+        raise ValueError("Başlangıç saatini saat:dakika:saniye biçiminde gir. Örnek 14:25:22.")
     record_name = slug(name)
     if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
