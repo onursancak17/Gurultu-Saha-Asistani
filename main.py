@@ -467,7 +467,7 @@ def svl(config, data, title):
     start_date, start_time = encoded_time(config.start)
     device_filename = ("SIM" + slug(config.name).replace("-", "").replace("_", "")[:5]).encode("ascii")
     ascii_title = normalize("NFKD", title.replace("ı", "i").replace("İ", "I"))
-    description = ("SIMULASYON | EGITIM / YAZILIM TESTI | " + ascii_title).encode("ascii", errors="ignore")[:126]
+    description = ("EGITIM / YAZILIM TESTI | " + ascii_title).encode("ascii", errors="ignore")[:126]
     # Match the reference format's fixed title block and include a NUL terminator.
     description = description.ljust(130, b"\0")
 
