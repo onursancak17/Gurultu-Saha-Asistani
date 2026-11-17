@@ -302,22 +302,18 @@ def measurement_form(st):
     section(st, "Ölçüm metodu")
     period = st.selectbox("TS ISO 1996-1/2 · Çevresel gürültü", PERIODS)
     section(st, "Tesis ve ölçüm noktası")
-    plant = st.text_input("Tesis adı")
+    plant = st.text_input("Tesis adı").strip()
     point_count = st.number_input("Ölçüm noktası sayısı", min_value=1, value=1, step=1)
-    point = st.text_input("Ölçüm noktası" if point_count == 1 else "1. nokta adı",
-                          value="" if point_count == 1 else "Nokta 1", key="first_measurement_point")
+    point = f"{plant}1"
     following_points = []
     if point_count > 1:
         st.caption("Her geçiş süresi, önceki noktadaki son kayıt bittiğinde başlar.")
         for number in range(2, point_count + 1):
-            name_col, gap_col = st.columns(2)
-            next_point = name_col.text_input(f"{number}. nokta adı", f"Nokta {number}",
-                                             key=f"measurement_point_{number}")
-            transition = gap_col.number_input(
+            transition = st.number_input(
                 f"{number - 1}. → {number}. nokta arası (sn)",
                 min_value=0, value=0, step=2, key=f"point_transition_{number}",
             )
-            following_points.append((next_point, transition))
+            following_points.append((f"{plant}{number}", transition))
     setting = st.selectbox("Ortam", ("Dış ortam", "İç ortam"))
     mode = st.text_input("İşletme modu", placeholder="Örn. tesis tam yükte")
     with st.expander("Saha bilgileri"):
