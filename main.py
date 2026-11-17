@@ -1024,9 +1024,23 @@ def show_results(st):
             ], hide_index=True)
     if any(config.start.second % 2 for _, _, config, _, _ in rows):
         st.caption("Çizelge tam başlangıç saatlerini gösterir. SVL başlığı tek saniyeleri önceki çift saniyeye yazar.")
-    selection = work_field(st, st.selectbox, "selected_record", "Kayıt", 0,
-                           options=range(len(rows)), format_func=lambda index: rows[index][0])
+    selection_key = "noise_field_selected_record"
+    selected = st.session_state.get(selection_key, workspace["draft"].get("selected_record", 0))
+    if not isinstance(selected, int) or selected not in range(len(rows)):
+        selected = 0
+    st.session_state[selection_key] = selected
+
+    def save_selected_record():
+        workspace["draft"]["selected_record"] = st.session_state[selection_key]
+
+    selection = st.selectbox(
+        "Kayıt", options=range(len(rows)), key=selection_key,
+        format_func=lambda index: rows[index][0], on_change=save_selected_record,
+    )
+    workspace["draft"]["selected_record"] = selection
     label, filename, config, data, file_bytes = rows[selection]
+    chart_key = f"{(workspace.get('run') or {}).get('seed', 'restored')}_{selection}"
+    st.caption(f"Gösterilen kayıt · {label}")
     cols = st.columns(2)
     cols[0].metric("LAeq · dB(A)", f"{average_centi(data.a) / 100:.2f}".replace(".", ","))
     cols[1].metric("LCeq · dB(C)", f"{average_centi(data.c) / 100:.2f}".replace(".", ","))
@@ -1034,13 +1048,23 @@ def show_results(st):
                f"{len(data.a)} kayıt · {len(data.peak_starts)} işaretli yükseliş")
     if saved_maximum is not None:
         st.metric("Bu kayıttaki pik / girilen üst sınır", f"{len(data.peak_starts)} / {saved_maximum}")
-    show_noise_chart(st, data)
+    show_noise_chart(st, data, key=f"noise_history_{chart_key}")
     with st.expander(f"Ortalama ⅓ oktav spektrumu · {config.spectrum_filter} filtresi"):
         spectrum = {
             "Hz": [f"{frequency:g}" for frequency in FREQUENCIES],
             "Leq (dB)": [level / 100 for level in average_bands(data)],
         }
-        st.bar_chart(spectrum, x="Hz", y="Leq (dB)", sort=False)
+        st.vega_lite_chart(
+            [{"Hz": frequency, "Leq": level} for frequency, level in zip(spectrum["Hz"], spectrum["Leq (dB)"])],
+            {
+                "mark": {"type": "bar", "tooltip": True},
+                "encoding": {
+                    "x": {"field": "Hz", "type": "ordinal", "sort": spectrum["Hz"]},
+                    "y": {"field": "Leq", "type": "quantitative", "title": "Leq (dB)"},
+                },
+            },
+            width="stretch", key=f"noise_spectrum_{chart_key}",
+        )
         st.dataframe(spectrum, hide_index=True)
     st.download_button("Simülasyon SVL dosyasını indir", file_bytes, filename,
                        "application/octet-stream", use_container_width=True, on_click="ignore")
@@ -1055,7 +1079,7 @@ def show_results(st):
     st.caption("Simülasyon verisi · Eğitim ve yazılım testi")
 
 
-def show_noise_chart(st, data):
+def show_noise_chart(st, data, key=None):
     peak_starts = set(data.peak_starts)
     series = [
         {"Saniye": index + 1, "LAeq": a / 100, "LCeq": c / 100, "yukselis": index in peak_starts}
@@ -1091,7 +1115,7 @@ def show_noise_chart(st, data):
                 },
             ],
         },
-        width="stretch",
+        width="stretch", key=key,
     )
     if peak_starts:
         st.caption("Sarı üçgenler simülasyondaki yükselişlerin başladığı saniyeleri gösterir.")
