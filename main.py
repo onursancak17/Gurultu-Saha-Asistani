@@ -63,6 +63,7 @@ class Measurement:
     reference_spectrum: bool = False
     detailed_svl: bool = False
     device_serial: int | None = None
+    calibration_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -474,12 +475,18 @@ def svl(config, data, file_stem=None):
         [0x0300, start_date, start_time] + [0] * 6
     )
     serial = config.device_serial or 0
+    calibrated = int(config.calibration_at is not None)
+    software_date = 10531 if calibrated else 0  # Reference firmware issue date, 03.09.2020.
     # SVAN 971 unit header stores the serial in two 16-bit words.
-    unit = words([0x0B02, serial & 0xFFFF, 971, 114, 0, 1, 1, 114, 114, 1, serial >> 16])
-    calibration = words([0x0B47, 0, 0, 0, 0, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 9400, 0xFFFF])
+    unit = words([0x0B02, serial & 0xFFFF, 971, 114, software_date, 1, 1, 114, 114, 1, serial >> 16])
+    calibration_date, calibration_time = encoded_time(config.calibration_at) if calibrated else (0, 0)
+    calibration = words([
+        0x0B47, calibrated, calibration_date, calibration_time, 136 if calibrated else 0,
+        0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 9400, 0xFFFF,
+    ])
     user_text = words([0x4203]) + description
     general = [
-        0x4004, start_date, start_time, 3, 2, 2 if config.high_range else 1, 0, 1, 1, 3,
+        0x4004, start_date, start_time, 3, 2, 2 if config.high_range else 1, calibrated, 1, 1, 3,
         config.delay, config.seconds, 0, 2, 0, 2 if config.spectrum_filter == "A" else 1,
         8, 480, 0, 1, 0, 0, 800, 0, 3,
         800, 0, 3, 800, 0, 5, 127, 0, 0, 0, 0,
@@ -515,7 +522,7 @@ def svl(config, data, file_stem=None):
         samples, details, band_extrema, stat_header, stat_levels, histogram, overload = detailed_logger(
             config, samples, profiles,
         )
-        general[6] = 2 if overload else 0
+        general[6] = calibrated | (2 if overload else 0)
         general[31] = 127  # main results, four spectrum blocks, levels and histograms
 
     main_results = [0x4407, 0x0307]
@@ -527,7 +534,7 @@ def svl(config, data, file_stem=None):
         main_results.extend([
             0x1608, elapsed, 0, peak, round(leq + 1000 * log10(config.seconds)),
             maximum, minimum, spl, leq, den, takt3, takt5, *([0] * 7),
-            flags | (2 if overload else 0),
+            flags | calibrated | (2 if overload else 0),
             UNAVAILABLE, UNAVAILABLE,
         ])
     spectrum = [0x2710, 0x0101, 2000, 31, 3]
@@ -862,6 +869,7 @@ def measurement_form(st):
         maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
         spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum, detailed_svl=True,
         device_serial=device_serial,
+        calibration_enabled=True,
         independent_range=independent_range,
         gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
@@ -918,7 +926,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
                   reference_spectrum=False, detailed_svl=False, device_serial=None,
-                  independent_range=None):
+                  independent_range=None, calibration_enabled=False):
     if not isinstance(clock, time):
         raise ValueError("Başlangıç saatini saat:dakika:saniye biçiminde gir. Örnek 14:25:22.")
     record_name = slug(name)
@@ -953,6 +961,19 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     plant = plant.strip()
     title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
     next_start = datetime.combine(day, clock)
+    calibration_at = None
+    if calibration_enabled:
+        seconds_since_midnight = clock.hour * 3600 + clock.minute * 60 + clock.second
+        if seconds_since_midnight < 480:
+            raise ValueError(
+                "Aynı tarihte 8–10 dakika önce kalibrasyon için başlangıç saati en erken 00:08:00 olabilir."
+            )
+        calibration_rng = Random(f"{seed}|pre-calibration")
+        # Calibration timestamps use the SVL header's two-second resolution.
+        delay_seconds = calibration_rng.randrange(
+            480 + clock.second % 2, min(600, seconds_since_midnight) + 1, 2,
+        )
+        calibration_at = next_start - timedelta(seconds=delay_seconds)
     duration = timedelta(minutes=minutes)
     if maximum_peaks is not None and maximum_peaks < 0:
         raise ValueError("Maksimum pik sayısı negatif olamaz.")
@@ -997,7 +1018,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                                  natural_peaks=peak_limit is not None, variable_baseline=variable_baseline,
                                  variable_spectrum=variable_spectrum, spectrum_filter=spectrum_filter,
                                  reference_spectrum=reference_spectrum and not is_background,
-                                 detailed_svl=detailed_svl, device_serial=device_serial)
+                                 detailed_svl=detailed_svl, device_serial=device_serial,
+                                 calibration_at=calibration_at)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
@@ -1083,6 +1105,11 @@ def show_results(st):
     cols[1].metric("LCeq · dB(C)", f"{average_centi(data.c) / 100:.2f}".replace(".", ","))
     st.caption(f"{config.start:%d.%m.%Y %H:%M:%S} · {config.seconds // 60} dk · "
                f"{len(data.a)} kayıt · {len(data.peak_starts)} işaretli yükseliş")
+    if config.calibration_at is not None:
+        st.caption(
+            f"Kalibrasyon · {config.calibration_at:%d.%m.%Y %H:%M:%S} · "
+            "94,00 dB · Katsayı +1,36 dB"
+        )
     if saved_maximum is not None:
         st.metric("Bu kayıttaki pik / girilen üst sınır", f"{len(data.peak_starts)} / {saved_maximum}")
     show_noise_chart(st, data, key=f"noise_history_{chart_key}")
