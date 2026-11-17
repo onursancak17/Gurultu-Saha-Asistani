@@ -647,7 +647,7 @@ def render_workspace(st):
     if st.session_state.pop("noise_restore_failed", False):
         st.warning("Son sonuç geri yüklenemedi. Kayıtlı formdan yeni simülasyon oluşturabilirsin.")
     if page == "Sonuçlar":
-        show_results(st)
+        st.fragment(show_results)(st)
         return
     if page == "Ana ekran" and not draft.get("device_selected"):
         with st.container(border=True):
@@ -679,7 +679,7 @@ def render_workspace(st):
             st.error(str(error))
             return
     if st.session_state.get("results"):
-        show_results(st)
+        st.fragment(show_results)(st)
 
 
 def section(st, label):
@@ -1024,22 +1024,25 @@ def show_results(st):
             ], hide_index=True)
     if any(config.start.second % 2 for _, _, config, _, _ in rows):
         st.caption("Çizelge tam başlangıç saatlerini gösterir. SVL başlığı tek saniyeleri önceki çift saniyeye yazar.")
-    selection_key = "noise_field_selected_record"
-    selected = st.session_state.get(selection_key, workspace["draft"].get("selected_record", 0))
-    if not isinstance(selected, int) or selected not in range(len(rows)):
-        selected = 0
-    st.session_state[selection_key] = selected
+    labels = [row[0] for row in rows]
+    run_seed = (workspace.get("run") or {}).get("seed", "restored")
+    selection_key = f"noise_field_record_choice_{run_seed}"
+    if selection_key not in st.session_state:
+        selected = workspace["draft"].get("selected_record", 0)
+        if not isinstance(selected, int) or selected not in range(len(rows)):
+            selected = 0
+        st.session_state[selection_key] = labels[selected]
 
     def save_selected_record():
-        workspace["draft"]["selected_record"] = st.session_state[selection_key]
+        workspace["draft"]["selected_record"] = labels.index(st.session_state[selection_key])
 
-    selection = st.selectbox(
-        "Kayıt", options=range(len(rows)), key=selection_key,
-        format_func=lambda index: rows[index][0], on_change=save_selected_record,
+    chosen_label = st.selectbox(
+        "Kayıt", options=labels, key=selection_key, on_change=save_selected_record,
     )
+    selection = labels.index(chosen_label)
     workspace["draft"]["selected_record"] = selection
     label, filename, config, data, file_bytes = rows[selection]
-    chart_key = f"{(workspace.get('run') or {}).get('seed', 'restored')}_{selection}"
+    chart_key = f"{run_seed}_{selection}"
     st.caption(f"Gösterilen kayıt · {label}")
     cols = st.columns(2)
     cols[0].metric("LAeq · dB(A)", f"{average_centi(data.a) / 100:.2f}".replace(".", ","))
@@ -1057,6 +1060,8 @@ def show_results(st):
         st.vega_lite_chart(
             [{"Hz": frequency, "Leq": level} for frequency, level in zip(spectrum["Hz"], spectrum["Leq (dB)"])],
             {
+                "name": f"noise_spectrum_{chart_key}",
+                "title": label,
                 "mark": {"type": "bar", "tooltip": True},
                 "encoding": {
                     "x": {"field": "Hz", "type": "ordinal", "sort": spectrum["Hz"]},
@@ -1077,6 +1082,12 @@ def show_results(st):
                            "SIMULASYON_SVL.zip", "application/zip",
                            use_container_width=True, on_click="ignore")
     st.caption("Simülasyon verisi · Eğitim ve yazılım testi")
+    selection_storage = st.components.v2.component("noise_workspace_storage", js=WORKSPACE_STORAGE)
+    with st.container(key="noise-selection-storage"):
+        selection_storage(
+            data={"workspace": json.dumps(workspace, default=lambda value: value.isoformat())},
+            key="noise_selection_storage", on_failed_change=lambda: None,
+        )
 
 
 def show_noise_chart(st, data, key=None):
@@ -1088,6 +1099,7 @@ def show_noise_chart(st, data, key=None):
     st.vega_lite_chart(
         series,
         {
+            "name": key or "noise_history",
             "height": 300,
             "encoding": {"x": {"field": "Saniye", "type": "quantitative"}},
             "layer": [
