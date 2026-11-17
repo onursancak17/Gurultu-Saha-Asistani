@@ -303,7 +303,21 @@ def measurement_form(st):
     period = st.selectbox("TS ISO 1996-1/2 · Çevresel gürültü", PERIODS)
     section(st, "Tesis ve ölçüm noktası")
     plant = st.text_input("Tesis adı")
-    point = st.text_input("Ölçüm noktası")
+    point_count = st.number_input("Ölçüm noktası sayısı", min_value=1, value=1, step=1)
+    point = st.text_input("Ölçüm noktası" if point_count == 1 else "1. nokta adı",
+                          value="" if point_count == 1 else "Nokta 1", key="first_measurement_point")
+    following_points = []
+    if point_count > 1:
+        st.caption("Her geçiş süresi, önceki noktadaki son kayıt bittiğinde başlar.")
+        for number in range(2, point_count + 1):
+            name_col, gap_col = st.columns(2)
+            next_point = name_col.text_input(f"{number}. nokta adı", f"Nokta {number}",
+                                             key=f"measurement_point_{number}")
+            transition = gap_col.number_input(
+                f"{number - 1}. → {number}. nokta arası (sn)",
+                min_value=0, value=0, step=2, key=f"point_transition_{number}",
+            )
+            following_points.append((next_point, transition))
     setting = st.selectbox("Ortam", ("Dış ortam", "İç ortam"))
     mode = st.text_input("İşletme modu", placeholder="Örn. tesis tam yükte")
     with st.expander("Saha bilgileri"):
@@ -337,9 +351,9 @@ def measurement_form(st):
         st.warning(f"Seçilen saha planında önerilen süre {recommended} dk. Simülasyon oluşturulabilir.")
     repeats = st.number_input("Cihaz tekrar sayısı", 1, 10, 1)
     gap_seconds = st.number_input(
-        "Ölçümler arası bekleme (sn)", min_value=0, value=0, step=2,
-        help="Bir kayıt bittikten sonra sonraki kayıt başlayana kadar geçen süre. "
-             "Arka plan kaydı da bu süre kadar sonra başlar. SVL zamanları 2 saniye çözünürlüklüdür.",
+        "Aynı noktadaki ölçümler arası bekleme (sn)", min_value=0, value=0, step=2,
+        help="Aynı noktadaki tekrarlar ve arka plan kaydı için kullanılır. "
+             "SVL zamanları 2 saniye çözünürlüklüdür.",
     )
 
     section(st, "Kayıt ve ses seviyesi")
@@ -371,36 +385,55 @@ def measurement_form(st):
         site_notes=site_notes,
         minutes=minutes, repeats=repeats, name=name, a=a, c=c, count=count,
         length=length, gain=gain, background=background, high_range=high_range, delay=delay,
-        min_gain=min_gain, gap_seconds=gap_seconds,
+        min_gain=min_gain, gap_seconds=gap_seconds, following_points=following_points,
     )
 
 
 def build_results(plant, point, setting, mode, day, clock, minutes, repeats, name,
                   a, c, count, length, gain, background, high_range, delay, site_notes="",
-                  min_gain=None, gap_seconds=0):
-    if not plant.strip() or not point.strip() or not slug(name).strip("_-"):
+                  min_gain=None, gap_seconds=0, following_points=()):
+    record_name = slug(name)
+    if not plant.strip() or not point.strip() or not record_name.strip("_-"):
         raise ValueError("Tesis adı, ölçüm noktası ve SVL kayıt adı gerekli.")
     if gap_seconds < 0 or gap_seconds % 2:
         raise ValueError("Ölçümler arası bekleme için 0 veya 2'nin katı olan bir saniye değeri gir.")
-    title = f"{plant.strip()} / {point.strip()}"
-    metadata = f"{title} | {setting} | {mode.strip()}"
-    start = datetime.combine(day, clock)
-    start -= timedelta(seconds=start.second % 2, microseconds=start.microsecond)
-    record_interval = timedelta(minutes=minutes, seconds=gap_seconds)
+    points = [(point.strip(), 0)]
+    for number, (next_point, transition) in enumerate(following_points, start=2):
+        if not next_point.strip():
+            raise ValueError(f"{number}. noktanın adını gir.")
+        if transition < 0 or transition % 2:
+            raise ValueError(f"{number - 1}. → {number}. nokta arası süre 0 veya 2'nin katı olmalı.")
+        points.append((next_point.strip(), transition))
+    multi_point = len(points) > 1
+    plant = plant.strip()
+    title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
+    next_start = datetime.combine(day, clock)
+    next_start -= timedelta(seconds=next_start.second % 2, microseconds=next_start.microsecond)
+    duration = timedelta(minutes=minutes)
+    record_interval = duration + timedelta(seconds=gap_seconds)
     rows = []
-    for index in range(repeats + (background is not None)):
-        is_background = index == repeats
-        label = "Arka plan" if is_background else f"Kaynak açık · Tekrar {index + 1}"
-        suffix = "FON" if is_background else f"{index + 1:02d}"
-        device_id = slug(name)[:max(1, 5 - len(suffix))] + suffix
-        level_a = background if is_background else a
-        level_c = background + 7.0 if is_background else c
-        config = Measurement(device_id, start + record_interval * index,
-                             minutes * 60, level_a, level_c, 0 if is_background else count,
-                             length, gain, delay, high_range, event_min_gain=min_gain)
-        data = simulate(config)
-        filename = f"SIMULASYON_{slug(name)}_{suffix}.SVL"
-        rows.append((label, filename, config, data, svl(config, data, metadata + " | " + label)))
+    for number, (point_name, transition) in enumerate(points, start=1):
+        next_start += timedelta(seconds=transition)
+        metadata = f"{plant} / {point_name} | {setting} | {mode.strip()}"
+        for index in range(repeats + (background is not None)):
+            is_background = index == repeats
+            label = "Arka plan" if is_background else f"Kaynak açık · Tekrar {index + 1}"
+            suffix = "FON" if is_background else f"{index + 1:02d}"
+            if multi_point:
+                label = f"{number}. {point_name} · {label}"
+                suffix = f"N{number:03d}_{suffix}"
+                device_id = f"{len(rows) + 1:05d}"
+            else:
+                device_id = record_name[:max(1, 5 - len(suffix))] + suffix
+            level_a = background if is_background else a
+            level_c = background + 7.0 if is_background else c
+            config = Measurement(device_id, next_start + record_interval * index,
+                                 minutes * 60, level_a, level_c, 0 if is_background else count,
+                                 length, gain, delay, high_range, event_min_gain=min_gain)
+            data = simulate(config)
+            filename = f"SIMULASYON_{record_name}_{suffix}.SVL"
+            rows.append((label, filename, config, data, svl(config, data, metadata + " | " + label)))
+        next_start = config.start + duration
     return title, rows, site_notes
 
 
@@ -414,6 +447,13 @@ def show_results(st):
     st.write(title)
     if site_notes:
         st.caption(site_notes)
+    if len(rows) > 1:
+        with st.expander("Ölçüm zaman çizelgesi"):
+            st.dataframe([
+                {"Kayıt": label, "Başlangıç": config.start.strftime("%d.%m.%Y %H:%M:%S"),
+                 "Bitiş": (config.start + timedelta(seconds=config.seconds)).strftime("%d.%m.%Y %H:%M:%S")}
+                for label, _, config, _, _ in rows
+            ], hide_index=True)
     selection = st.selectbox("Kayıt", range(len(rows)), format_func=lambda index: rows[index][0])
     label, filename, config, data, file_bytes = rows[selection]
     cols = st.columns(2)
