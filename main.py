@@ -46,6 +46,7 @@ REFERENCE_A_OFFSETS = (
 )
 REFERENCE_BAND_FLOOR = 800
 CALIBRATION_CORRECTION = 136
+SPECTRUM_REVISION = 3
 PERIODS = ("Türkiye Ek-2 – 5 dk referans", "ISO 1996-2 – elverişli veya geometri koşulu", "ISO 1996-2 – diğer koşullar")
 DEFAULT_POINT_VARIATION_DB = 5.0
 DEVICE_SERIALS = (107410, 107406, 23287)
@@ -75,7 +76,7 @@ class Measurement:
     detailed_svl: bool = False
     device_serial: int | None = None
     calibration_at: datetime | None = None
-    spectrum_revision: int = 2
+    spectrum_revision: int = SPECTRUM_REVISION
 
 
 @dataclass(frozen=True)
@@ -353,7 +354,10 @@ def simulate(config, rng=None, spectrum=None):
         c_minus_a = 10 * log10(weighted_energy(spectrum, C_WEIGHT) / weighted_energy(spectrum, A_WEIGHT))
     spectral_rows, band_average, average_z = b"", (), None
     octave_floor = 0
-    if config.reference_spectrum and config.spectrum_revision >= 2 and config.spectrum_filter == "A":
+    uses_band_floor = config.spectrum_revision >= SPECTRUM_REVISION or (
+        config.reference_spectrum and config.spectrum_revision >= 2
+    )
+    if uses_band_floor and config.spectrum_filter == "A":
         # The observed A-band reporting limit tracks the calibration correction.
         # Apply it to the saved/displayed bands after calculating A, C and Z.
         octave_floor = REFERENCE_BAND_FLOOR
@@ -633,14 +637,30 @@ def restore_workspace(st, raw):
     except (AttributeError, TypeError, ValueError):
         workspace = {"draft": {}, "run": None}
     st.session_state.noise_workspace = workspace
+    load_saved_run(st)
+
+
+def load_saved_run(st):
+    workspace = st.session_state.noise_workspace
     saved_run = workspace.get("run")
     if saved_run:
         try:
             inputs = dict(saved_run["inputs"])
-            inputs["day"] = date.fromisoformat(inputs["day"])
-            inputs["clock"] = time.fromisoformat(inputs["clock"])
-            inputs.setdefault("spectrum_revision", 1)
-            st.session_state.results = build_results(**inputs, seed=saved_run["seed"])
+            if isinstance(inputs["day"], str):
+                inputs["day"] = date.fromisoformat(inputs["day"])
+            if isinstance(inputs["clock"], str):
+                inputs["clock"] = time.fromisoformat(inputs["clock"])
+            seed = saved_run["seed"]
+            revision = inputs.setdefault("spectrum_revision", 1)
+            if revision < SPECTRUM_REVISION:
+                try:
+                    updated_inputs = {**inputs, "spectrum_revision": SPECTRUM_REVISION}
+                    st.session_state.results = build_results(**updated_inputs, seed=seed)
+                    saved_run["inputs"] = updated_inputs
+                    return
+                except ValueError as error:
+                    st.session_state.noise_spectrum_upgrade_failure = (seed, str(error))
+            st.session_state.results = build_results(**inputs, seed=seed)
         except (KeyError, TypeError, ValueError, OverflowError):
             workspace["run"] = None
             st.session_state.noise_restore_failed = True
@@ -650,7 +670,7 @@ def reset_workspace(st):
     st.session_state.noise_workspace = {"draft": {}, "run": None}
     for key in list(st.session_state):
         if key.startswith("noise_field_") or key in (
-            "device_selected", "results", "noise_defaults", "noise_restore_failed",
+            "device_selected", "results", "noise_defaults", "noise_restore_failed", "noise_spectrum_upgrade_failure",
         ):
             del st.session_state[key]
 
@@ -681,7 +701,14 @@ def work_field(st, widget, key, label, default=None, *, multiple=False, **option
 
 
 def render_workspace(st):
-    draft = st.session_state.noise_workspace["draft"]
+    workspace = st.session_state.noise_workspace
+    draft = workspace["draft"]
+    saved_run = workspace.get("run")
+    failed_upgrade = st.session_state.get("noise_spectrum_upgrade_failure")
+    if saved_run and saved_run["inputs"].get("spectrum_revision", 1) < SPECTRUM_REVISION and (
+        not failed_upgrade or failed_upgrade[0] != saved_run["seed"]
+    ):
+        load_saved_run(st)
     with st.sidebar:
         st.markdown("## Gürültü Saha Asistanı")
         page = work_field(st, st.radio, "page", "Menü", "Ana ekran",
@@ -697,6 +724,10 @@ def render_workspace(st):
     )
     if st.session_state.pop("noise_restore_failed", False):
         st.warning("Son sonuç geri yüklenemedi. Kayıtlı formdan yeni simülasyon oluşturabilirsin.")
+    saved_run = workspace.get("run")
+    failed_upgrade = st.session_state.get("noise_spectrum_upgrade_failure")
+    if saved_run and failed_upgrade and failed_upgrade[0] == saved_run["seed"]:
+        st.warning(f"Kayıtlı çalışmada spektrum güncellenemedi. {failed_upgrade[1]}")
     if page == "Sonuçlar":
         st.fragment(show_results)(st)
         return
@@ -709,20 +740,24 @@ def render_workspace(st):
         return
 
     inputs = measurement_form(st)
-    saved_run = st.session_state.noise_workspace.get("run")
     previous_limit = saved_run["inputs"].get("maximum_peaks") if saved_run else None
     limit_changed = saved_run is not None and previous_limit != inputs["maximum_peaks"]
     filter_changed = saved_run is not None and (
         saved_run["inputs"].get("spectrum_filter", "Z") != inputs["spectrum_filter"]
     )
-    if st.button("Ölçüm Yap", type="primary", use_container_width=True) or limit_changed or filter_changed:
+    profile_changed = saved_run is not None and (
+        saved_run["inputs"].get("reference_spectrum", False) != inputs["reference_spectrum"]
+    )
+    if st.button("Ölçüm Yap", type="primary", use_container_width=True) or limit_changed or filter_changed or profile_changed:
         try:
             seed = token_hex(16)
             st.session_state.results = build_results(**inputs, seed=seed)
             st.session_state.noise_workspace["run"] = {"inputs": inputs, "seed": seed}
             draft.pop("selected_record", None)
             st.session_state.pop("noise_field_selected_record", None)
-            if filter_changed:
+            if profile_changed:
+                st.success("Frekans dağılımı uygulandı. Noktaların sonuçları yenilendi.")
+            elif filter_changed:
                 st.success(f"{inputs['spectrum_filter']} spektrum filtresi uygulandı. Noktaların sonuçları yenilendi.")
             elif limit_changed:
                 st.success(f"Pik üst sınırı {inputs['maximum_peaks']} uygulandı. Noktaların sonuçları yenilendi.")
@@ -901,7 +936,8 @@ def measurement_form(st):
         )
         reference_spectrum = field(
             st.checkbox, "reference_spectrum", "Orijinal SVL kayıtlarına benzer frekans dağılımı", False,
-            help="Kaynak açık simülasyonunda 11 orijinal SVL kaydının ⅓ oktav bantlarını esas alır.",
+            help="Kaynak açık simülasyonunda 11 orijinal SVL kaydının ⅓ oktav bantlarını esas alır. "
+                 "Bu ayarı değiştirince mevcut sonuçlar yenilenir.",
         )
         st.caption("Kayıt adımı 1 sn · ⅓ oktav · Başlangıç senkronizasyonu kapalı")
     return dict(
@@ -911,7 +947,7 @@ def measurement_form(st):
         length=1, gain=8.0, background=background, high_range=high_range, delay=delay,
         maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
         spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum, detailed_svl=True,
-        spectrum_revision=2,
+        spectrum_revision=SPECTRUM_REVISION,
         device_serial=device_serial,
         calibration_enabled=True,
         independent_range=independent_range,
@@ -970,7 +1006,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
                   reference_spectrum=False, detailed_svl=False, device_serial=None,
-                  independent_range=None, calibration_enabled=False, spectrum_revision=2):
+                  independent_range=None, calibration_enabled=False, spectrum_revision=SPECTRUM_REVISION):
     if not isinstance(clock, time):
         raise ValueError("Başlangıç saatini saat:dakika:saniye biçiminde gir. Örnek 14:25:22.")
     record_name = slug(name)
@@ -1144,7 +1180,7 @@ def show_results(st):
     selection = labels.index(chosen_label)
     workspace["draft"]["selected_record"] = selection
     label, filename, config, data, file_bytes = rows[selection]
-    chart_key = f"{run_seed}_{selection}"
+    chart_key = f"{run_seed}_{config.spectrum_revision}_{selection}"
     st.caption(f"Gösterilen kayıt · {label}")
     cols = st.columns(2)
     cols[0].metric("LAeq · dB(A)", f"{average_centi(data.a) / 100:.2f}".replace(".", ","))
