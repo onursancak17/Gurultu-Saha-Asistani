@@ -35,6 +35,17 @@ REFERENCE_A_BANDS = (
     1867, 2277, 3561, 3125, 3136, 2825, 2180, 2038, 1881, 2111,
     1854, 1883, 2005, 1650, 1327, 1113, 936, 936, 936, 936,
 )
+# Median band level relative to LAeq in the eleven reference files. Values
+# at each file's repeated lower limit were excluded. Valid bands run from
+# 31.5 Hz to 12.5 kHz; the remaining four bands are below the observed limit.
+REFERENCE_A_OFFSETS = (
+    -49.60, -42.73, -34.89, -32.97, -30.93, -30.31, -29.32, -28.40,
+    -22.08, -17.81, -14.71, -4.03, -5.66, -9.77, -13.55, -16.80,
+    -16.13, -17.22, -17.48, -19.01, -18.82, -19.19, -23.43, -26.33,
+    -29.84, -36.01, -44.86,
+)
+REFERENCE_BAND_FLOOR = 800
+CALIBRATION_CORRECTION = 136
 PERIODS = ("Türkiye Ek-2 – 5 dk referans", "ISO 1996-2 – elverişli veya geometri koşulu", "ISO 1996-2 – diğer koşullar")
 DEFAULT_POINT_VARIATION_DB = 5.0
 DEVICE_SERIALS = (107410, 107406, 23287)
@@ -64,6 +75,7 @@ class Measurement:
     detailed_svl: bool = False
     device_serial: int | None = None
     calibration_at: datetime | None = None
+    spectrum_revision: int = 2
 
 
 @dataclass(frozen=True)
@@ -76,6 +88,7 @@ class Simulation:
     band_average: tuple[int, ...] = ()
     average_z: int | None = None
     peak_starts: tuple[int, ...] = ()
+    octave_floor: int = 0
 
 
 def energy(level):
@@ -88,7 +101,8 @@ def average_centi(series):
 
 def average_bands(data):
     return data.band_average or tuple(
-        average_centi([max(0, a + offset) for a in data.a]) for offset in data.spectrum_offsets
+        average_centi([max(data.octave_floor, a + offset) for a in data.a])
+        for offset in data.spectrum_offsets
     )
 
 
@@ -103,15 +117,31 @@ def spectral_shape(center, width):
     return normalized, weighted_energy(normalized, C_WEIGHT)
 
 
-def spectral_endpoints(extended=False, reference=False):
+def reference_band_energy():
+    # Extrapolate censored tails using the measured slopes in dB per octave.
+    # These are model estimates used in the acoustic sum, before any
+    # reporting floor or conversion to the selected output weighting.
+    levels = REFERENCE_A_OFFSETS
+    low_slope = (levels[2] - levels[0]) / log2(50 / 31.5)
+    high_slope = (levels[-1] - levels[-3]) / log2(12500 / 8000)
+    low_tail = [levels[0] + low_slope * log2(freq / 31.5) for freq in FREQUENCIES[:2]]
+    high_tail = [levels[-1] + high_slope * log2(freq / 12500) for freq in FREQUENCIES[-2:]]
+    return [energy(level - weighting) for level, weighting in zip(
+        (*low_tail, *levels, *high_tail), A_WEIGHT,
+    )]
+
+
+def spectral_endpoints(extended=False, reference=False, spectrum_revision=2):
     if reference:
-        # Recover an approximate Z spectrum from the CVKALI22 A-weighted
-        # band averages. Exclude the recurring display floor from the energy.
-        floor_energy = energy(min(REFERENCE_A_BANDS) / 100)
-        bins = [
-            max(energy(level / 100) - floor_energy, 1e-12) / energy(weight)
-            for level, weight in zip(REFERENCE_A_BANDS, A_WEIGHT)
-        ]
+        if spectrum_revision < 2:
+            # Reproduce previously saved simulations with their original model.
+            floor_energy = energy(min(REFERENCE_A_BANDS) / 100)
+            bins = [
+                max(energy(level / 100) - floor_energy, 1e-12) / energy(weight)
+                for level, weight in zip(REFERENCE_A_BANDS, A_WEIGHT)
+            ]
+        else:
+            bins = reference_band_energy()
         bass_fraction = [1 / (1 + (frequency / 140) ** 4) for frequency in FREQUENCIES]
         endpoints = []
         for fractions in ([1 - fraction for fraction in bass_fraction], bass_fraction):
@@ -214,7 +244,7 @@ def add_natural_peaks(levels, count, rng):
     return tuple(starts)
 
 
-def vary_spectrum(a, target_delta, peak_gain, rng, endpoints, band_weights, reference):
+def vary_spectrum(a, target_delta, peak_gain, rng, endpoints, band_weights, reference, octave_floor=0):
     (high, high_c), (low, low_c) = endpoints
     target_mix = (energy(target_delta) - high_c) / (low_c - high_c)
     a_energy = [energy(level / 100) for level in a]
@@ -258,7 +288,7 @@ def vary_spectrum(a, target_delta, peak_gain, rng, endpoints, band_weights, refe
         mix = max(0.0, min(1.0, value + shift))
         bins = [weight * (hi * (1 - mix) + lo * mix) for hi, lo in zip(high, low)]
         bands = [
-            max(0, round(1000 * log10(value) + 100 * correction))
+            max(octave_floor, round(1000 * log10(value) + 100 * correction))
             for value, correction in zip(bins, band_weights)
         ]
         c_level = round(1000 * log10(weight * (high_c * (1 - mix) + low_c * mix)))
@@ -311,7 +341,9 @@ def simulate(config, rng=None, spectrum=None):
             )
     normalization = 10 * log10(sum(map(energy, relative)) / config.seconds)
     a = tuple(round(100 * (config.a + level - normalization)) for level in relative)
-    endpoints = spectral_endpoints(extended=True, reference=config.reference_spectrum)
+    endpoints = spectral_endpoints(
+        extended=True, reference=config.reference_spectrum, spectrum_revision=config.spectrum_revision,
+    )
     if spectrum is None:
         c_minus_a = config.c - config.a
         spectrum = spectral_mix(
@@ -320,10 +352,17 @@ def simulate(config, rng=None, spectrum=None):
     else:
         c_minus_a = 10 * log10(weighted_energy(spectrum, C_WEIGHT) / weighted_energy(spectrum, A_WEIGHT))
     spectral_rows, band_average, average_z = b"", (), None
+    octave_floor = 0
+    if config.reference_spectrum and config.spectrum_revision >= 2 and config.spectrum_filter == "A":
+        # The observed A-band reporting limit tracks the calibration correction.
+        # Apply it to the saved/displayed bands after calculating A, C and Z.
+        octave_floor = REFERENCE_BAND_FLOOR
+        if config.calibration_at is not None:
+            octave_floor += CALIBRATION_CORRECTION
     if config.variable_spectrum:
         c, spectral_rows, band_average, average_z = vary_spectrum(
             a, c_minus_a, [level - base for level, base in zip(relative, regular)], rng,
-            endpoints, band_weights, config.reference_spectrum,
+            endpoints, band_weights, config.reference_spectrum, octave_floor,
         )
     else:
         c = tuple(level + round(100 * c_minus_a) for level in a)
@@ -333,7 +372,7 @@ def simulate(config, rng=None, spectrum=None):
     if lower_level < minimum * 100 or max(max(a), max(c)) >= upper_peak * 100:
         raise ValueError("Senaryodaki seviyeler seçili cihaz aralığına sığmıyor. Seviyeleri veya aralığı düzenle.")
     offsets, z = spectrum_offsets(spectrum, band_weights)
-    return Simulation(a, c, offsets, z, spectral_rows, band_average, average_z, peak_starts)
+    return Simulation(a, c, offsets, z, spectral_rows, band_average, average_z, peak_starts, octave_floor)
 
 
 def words(values):
@@ -394,7 +433,7 @@ def period_level(start, series):
     return centi_level(combined / sum(weights[i] for i, _ in active)), sum(1 << i for i, _ in active) << 5
 
 
-def detailed_logger(config, samples, series):
+def detailed_logger(config, samples, series, octave_floor=0):
     signals = tuple(zip(*series))
     rng = Random(f"{config.start.isoformat()}|{config.name}")
     bottom = min(18 if config.high_range else 13, max(0, min(min(s) for s in series) // 100 - 4))
@@ -438,9 +477,13 @@ def detailed_logger(config, samples, series):
             payload += words([*result, leq])
         payload += words(row[4:])
         for index, level in enumerate(row[4:]):
-            band_extrema[0][index] = min(band_extrema[0][index], max(0, level + low))
-            band_extrema[1][index] = max(band_extrema[1][index], level + high)
-            band_extrema[2][index] = max(band_extrema[2][index], level + peak)
+            lower_limit = octave_floor if index < len(FREQUENCIES) else 0
+            minimum, maximum, peak_level = max(lower_limit, level + low), level + high, level + peak
+            if lower_limit and level == lower_limit:
+                minimum = maximum = peak_level = lower_limit
+            band_extrema[0][index] = min(band_extrema[0][index], minimum)
+            band_extrema[1][index] = max(band_extrema[1][index], maximum)
+            band_extrema[2][index] = max(band_extrema[2][index], peak_level)
 
     def takt(maxima, span):
         return average_centi([max(maxima[i:i + span]) for i in range(0, len(maxima), span)])
@@ -481,7 +524,7 @@ def svl(config, data, file_stem=None):
     unit = words([0x0B02, serial & 0xFFFF, 971, 114, software_date, 1, 1, 114, 114, 1, serial >> 16])
     calibration_date, calibration_time = encoded_time(config.calibration_at) if calibrated else (0, 0)
     calibration = words([
-        0x0B47, calibrated, calibration_date, calibration_time, 136 if calibrated else 0,
+        0x0B47, calibrated, calibration_date, calibration_time, CALIBRATION_CORRECTION if calibrated else 0,
         0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 9400, 0xFFFF,
     ])
     user_text = words([0x4203]) + description
@@ -510,7 +553,7 @@ def svl(config, data, file_stem=None):
     if not samples:
         samples = bytearray()
         for a, c in zip(data.a, data.c):
-            bands = [max(0, a + offset) for offset in data.spectrum_offsets]
+            bands = [max(data.octave_floor, a + offset) for offset in data.spectrum_offsets]
             samples += words([0, a, c, a, *bands, a, c, a + data.z_offset])
 
     profiles = (data.a, data.c, data.a)
@@ -520,7 +563,7 @@ def svl(config, data, file_stem=None):
     details = [(UNAVAILABLE,) * 4 + (0,) * 4] * len(profiles)
     if config.detailed_svl:
         samples, details, band_extrema, stat_header, stat_levels, histogram, overload = detailed_logger(
-            config, samples, profiles,
+            config, samples, profiles, data.octave_floor,
         )
         general[6] = calibrated | (2 if overload else 0)
         general[31] = 127  # main results, four spectrum blocks, levels and histograms
@@ -596,6 +639,7 @@ def restore_workspace(st, raw):
             inputs = dict(saved_run["inputs"])
             inputs["day"] = date.fromisoformat(inputs["day"])
             inputs["clock"] = time.fromisoformat(inputs["clock"])
+            inputs.setdefault("spectrum_revision", 1)
             st.session_state.results = build_results(**inputs, seed=saved_run["seed"])
         except (KeyError, TypeError, ValueError, OverflowError):
             workspace["run"] = None
@@ -856,9 +900,8 @@ def measurement_form(st):
                  "Sonuç varken filtreyi değiştirirsen sonuçlar otomatik yenilenir.",
         )
         reference_spectrum = field(
-            st.checkbox, "reference_spectrum", "CVKALI22 örneğine benzer frekans dağılımı", False,
-            help="Kaynak açık simülasyonunda örnek kaydın ortalama bant biçimini esas alır. "
-                 "Örnek dosya A ağırlıklı ⅓ oktav bantlarıyla kaydedilmiştir.",
+            st.checkbox, "reference_spectrum", "Orijinal SVL kayıtlarına benzer frekans dağılımı", False,
+            help="Kaynak açık simülasyonunda 11 orijinal SVL kaydının ⅓ oktav bantlarını esas alır.",
         )
         st.caption("Kayıt adımı 1 sn · ⅓ oktav · Başlangıç senkronizasyonu kapalı")
     return dict(
@@ -868,6 +911,7 @@ def measurement_form(st):
         length=1, gain=8.0, background=background, high_range=high_range, delay=delay,
         maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
         spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum, detailed_svl=True,
+        spectrum_revision=2,
         device_serial=device_serial,
         calibration_enabled=True,
         independent_range=independent_range,
@@ -926,7 +970,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
                   reference_spectrum=False, detailed_svl=False, device_serial=None,
-                  independent_range=None, calibration_enabled=False):
+                  independent_range=None, calibration_enabled=False, spectrum_revision=2):
     if not isinstance(clock, time):
         raise ValueError("Başlangıç saatini saat:dakika:saniye biçiminde gir. Örnek 14:25:22.")
     record_name = slug(name)
@@ -957,7 +1001,9 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     if c_bounds is not None and (None in c_bounds or c_bounds[0] > c_bounds[1]):
         raise ValueError("LCeq için geçerli bir alt ve üst sınır gir.")
     # Older saved sessions replay the original seeded generator and spectrum.
-    endpoints = spectral_endpoints(extended=True, reference=reference_spectrum) if a_bounds is not None else None
+    endpoints = spectral_endpoints(
+        extended=True, reference=reference_spectrum, spectrum_revision=spectrum_revision,
+    ) if a_bounds is not None else None
     plant = plant.strip()
     title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
     next_start = datetime.combine(day, clock)
@@ -1019,7 +1065,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                                  variable_spectrum=variable_spectrum, spectrum_filter=spectrum_filter,
                                  reference_spectrum=reference_spectrum and not is_background,
                                  detailed_svl=detailed_svl, device_serial=device_serial,
-                                 calibration_at=calibration_at)
+                                 calibration_at=calibration_at, spectrum_revision=spectrum_revision)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
@@ -1114,6 +1160,9 @@ def show_results(st):
         st.metric("Bu kayıttaki pik / girilen üst sınır", f"{len(data.peak_starts)} / {saved_maximum}")
     show_noise_chart(st, data, key=f"noise_history_{chart_key}")
     with st.expander(f"Ortalama ⅓ oktav spektrumu · {config.spectrum_filter} filtresi"):
+        if data.octave_floor:
+            limit = f"{data.octave_floor / 100:.2f}".replace(".", ",")
+            st.caption(f"{limit} dB, simülasyonun A ağırlıklı bantları için gösterim alt sınırıdır.")
         spectrum = {
             "Hz": [f"{frequency:g}" for frequency in FREQUENCIES],
             "Leq (dB)": [level / 100 for level in average_bands(data)],
