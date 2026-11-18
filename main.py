@@ -1,4 +1,5 @@
 """SVAN 971 için etiketli eğitim ve yazılım testi simülasyonu."""
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from functools import partial
@@ -6,7 +7,7 @@ from zoneinfo import ZoneInfo
 from html import escape
 from io import BytesIO
 import json
-from math import ceil, exp, floor, isfinite, log10, log2
+from math import ceil, erf, exp, floor, isfinite, log10, log2, sqrt
 from random import Random
 import re
 from secrets import token_hex
@@ -47,6 +48,15 @@ REFERENCE_A_OFFSETS = (
 REFERENCE_BAND_FLOOR = 800
 CALIBRATION_CORRECTION = 136
 SPECTRUM_REVISION = 3
+# Medians of per-record quantiles from CVKALI22, ORCALI1–3 and ORCTYT1–4.
+# Levels are relative to the run LAeq, and crest factors to one-second Leq.
+# ORCA26, ORCA27 and ORTY1 were held out from these estimates.
+REFERENCE_PERCENTILES = (0, .01, .05, .10, .25, .50, .75, .90, .95, .98, .99, 1)
+REFERENCE_LAEQ_OFFSETS = (
+    -16.40, -14.86, -12.51, -10.99, -7.58, -3.56, 1.14, 3.96, 5.46, 7.38, 7.91, 10.25,
+)
+REFERENCE_A_CREST = (9.82, 10.70, 11.48, 11.95, 12.68, 14.14, 16.03, 17.55, 19.09, 22.25, 24.57, 27.95)
+REFERENCE_C_CREST = (8.66, 9.55, 10.33, 10.68, 11.44, 12.41, 13.67, 15.47, 16.47, 17.43, 18.36, 23.20)
 PERIODS = ("Türkiye Ek-2 – 5 dk referans", "ISO 1996-2 – elverişli veya geometri koşulu", "ISO 1996-2 – diğer koşullar")
 DEFAULT_POINT_VARIATION_DB = 5.0
 DEVICE_SERIALS = (107410, 107406, 23287)
@@ -77,6 +87,7 @@ class Measurement:
     device_serial: int | None = None
     calibration_at: datetime | None = None
     spectrum_revision: int = SPECTRUM_REVISION
+    reference_dynamics: bool = False
 
 
 @dataclass(frozen=True)
@@ -194,6 +205,29 @@ def normal_profile(seconds, rng, fast_variation=0.0):
     return levels
 
 
+def reference_quantile(probability, values):
+    index = min(bisect_right(REFERENCE_PERCENTILES, probability), len(values) - 1)
+    low, high = REFERENCE_PERCENTILES[index - 1:index + 1]
+    fraction = (probability - low) / (high - low)
+    return values[index - 1] + fraction * (values[index] - values[index - 1])
+
+
+def normal_percentile(value):
+    return (1 + erf(value / sqrt(2))) / 2
+
+
+def reference_profile(seconds, rng):
+    # Retain short-term persistence while sampling the measured level distribution.
+    correlation = 0.60
+    innovation_scale = sqrt(1 - correlation ** 2)
+    state = rng.gauss(0, 1)
+    levels = []
+    for _ in range(seconds):
+        levels.append(reference_quantile(normal_percentile(state), REFERENCE_LAEQ_OFFSETS))
+        state = correlation * state + innovation_scale * rng.gauss(0, 1)
+    return levels
+
+
 def add_peak_events(levels, count, duration, minimum_gain, maximum_gain, rng):
     # Sampling on the shortened timeline leaves a normal second between
     # events and at both ends after each full event is inserted.
@@ -245,7 +279,7 @@ def add_natural_peaks(levels, count, rng):
     return tuple(starts)
 
 
-def vary_spectrum(a, target_delta, peak_gain, rng, endpoints, band_weights, reference, octave_floor=0):
+def vary_spectrum(a, target_delta, peak_gain, rng, endpoints, band_weights, bass_coupling, octave_floor=0):
     (high, high_c), (low, low_c) = endpoints
     target_mix = (energy(target_delta) - high_c) / (low_c - high_c)
     a_energy = [energy(level / 100) for level in a]
@@ -261,7 +295,6 @@ def vary_spectrum(a, target_delta, peak_gain, rng, endpoints, band_weights, refe
 
     amplitude = min(0.32, 0.10 + 0.85 * target_mix)
     # In the example, quiet A-weighted intervals retain more bass energy.
-    bass_coupling = 0.025 if reference else 0.0
     raw_mix = [
         target_mix + amplitude * value - bass_coupling * ((level - a[0]) / 100)
         for level, value in zip(a, motion)
@@ -327,10 +360,14 @@ def simulate(config, rng=None, spectrum=None):
     if config.variable_baseline:
         room = min(config.a - minimum, upper_peak - max(config.a, config.c))
         fast_variation = max(0.0, min(1.0, (room - 4.0) / 7.0))
-    relative = normal_profile(config.seconds, rng, fast_variation)
-    if config.reference_spectrum:
-        # The example has a wider central LAeq spread than the general profile.
-        relative = [level * 1.55 for level in relative]
+    if config.reference_dynamics and config.variable_baseline:
+        headroom = upper_peak - max(config.a, config.c)
+        variation_scale = max(0.0, min(1.0, (headroom - 1) / 20))
+        relative = [level * variation_scale for level in reference_profile(config.seconds, rng)]
+    else:
+        relative = normal_profile(config.seconds, rng, fast_variation)
+        if config.reference_spectrum:
+            relative = [level * 1.55 for level in relative]
     regular = relative.copy() if config.variable_spectrum else ()
     peak_starts = ()
     if config.event_count:
@@ -364,9 +401,12 @@ def simulate(config, rng=None, spectrum=None):
         if config.calibration_at is not None:
             octave_floor += CALIBRATION_CORRECTION
     if config.variable_spectrum:
+        bass_coupling = 0.025 if config.reference_spectrum else 0.0
+        if config.reference_dynamics:
+            bass_coupling = 0.018
         c, spectral_rows, band_average, average_z = vary_spectrum(
             a, c_minus_a, [level - base for level, base in zip(relative, regular)], rng,
-            endpoints, band_weights, config.reference_spectrum, octave_floor,
+            endpoints, band_weights, bass_coupling, octave_floor,
         )
     else:
         c = tuple(level + round(100 * c_minus_a) for level in a)
@@ -455,12 +495,22 @@ def detailed_logger(config, samples, series, octave_floor=0):
         modulation = [energy(rng.uniform(-3, 3)) for _ in range(10)]
         normalizer = sum(modulation) / len(modulation)
         factors = [value / normalizer for value in modulation]
-        # Use a synthetic crest factor inside each subsecond window.
-        crest = [rng.uniform(4, 11) for _ in factors]
         low = round(1000 * log10(min(factors)))
         high = round(1000 * log10(max(factors)))
-        peak = round(max(1000 * log10(factor) + 100 * db for factor, db in zip(factors, crest)))
-        overload = max(levels) + peak > overload_threshold
+        if config.reference_dynamics:
+            # Couple the A and C crest distributions without assigning the same
+            # peak excess to both profiles.
+            shared = rng.gauss(0, 1)
+            c_score = 0.70 * shared + sqrt(1 - 0.70 ** 2) * rng.gauss(0, 1)
+            a_peak = max(high, round(100 * reference_quantile(normal_percentile(shared), REFERENCE_A_CREST)))
+            c_peak = max(high, round(100 * reference_quantile(normal_percentile(c_score), REFERENCE_C_CREST)))
+        else:
+            crest = [rng.uniform(4, 11) for _ in factors]
+            a_peak = c_peak = round(max(
+                1000 * log10(factor) + 100 * db for factor, db in zip(factors, crest)
+            ))
+        profile_peaks = (a_peak, c_peak, a_peak)
+        overload = max(level + peak for level, peak in zip(levels, profile_peaks)) > overload_threshold
         overload_seconds += overload
         payload += words([row[0] | int(overload)])
         for profile, leq in enumerate(levels):
@@ -476,13 +526,15 @@ def detailed_logger(config, samples, series, octave_floor=0):
                 category = floor(log10(sample) * 10) - bottom
                 histograms[profile][max(0, min(STAT_CLASSES - 1, category))] += 1
             current[profile] = state
-            result = leq + peak, centi_level(high_power), centi_level(low_power)
+            result = leq + profile_peaks[profile], centi_level(high_power), centi_level(low_power)
             history[profile].append(result)
             payload += words([*result, leq])
         payload += words(row[4:])
+        octave_peak = a_peak if config.spectrum_filter == "A" else c_peak
+        band_peaks = (octave_peak,) * len(FREQUENCIES) + (a_peak, c_peak, c_peak)
         for index, level in enumerate(row[4:]):
             lower_limit = octave_floor if index < len(FREQUENCIES) else 0
-            minimum, maximum, peak_level = max(lower_limit, level + low), level + high, level + peak
+            minimum, maximum, peak_level = max(lower_limit, level + low), level + high, level + band_peaks[index]
             if lower_limit and level == lower_limit:
                 minimum = maximum = peak_level = lower_limit
             band_extrema[0][index] = min(band_extrema[0][index], minimum)
@@ -756,7 +808,7 @@ def render_workspace(st):
             draft.pop("selected_record", None)
             st.session_state.pop("noise_field_selected_record", None)
             if profile_changed:
-                st.success("Frekans dağılımı uygulandı. Noktaların sonuçları yenilendi.")
+                st.success("Ses profili değiştirildi. Noktaların sonuçları yenilendi.")
             elif filter_changed:
                 st.success(f"{inputs['spectrum_filter']} spektrum filtresi uygulandı. Noktaların sonuçları yenilendi.")
             elif limit_changed:
@@ -935,8 +987,9 @@ def measurement_form(st):
                  "Sonuç varken filtreyi değiştirirsen sonuçlar otomatik yenilenir.",
         )
         reference_spectrum = field(
-            st.checkbox, "reference_spectrum", "Orijinal SVL kayıtlarına benzer frekans dağılımı", False,
-            help="Kaynak açık simülasyonunda 11 orijinal SVL kaydının ⅓ oktav bantlarını esas alır. "
+            st.checkbox, "reference_spectrum", "Orijinal SVL kayıtlarına benzer ses profili", False,
+            help="Kaynak açık simülasyonunda orijinal SVL kayıtlarının frekans bantlarını, "
+                 "saniyelik dalgalanmalarını ve pik dağılımını esas alır. "
                  "Bu ayarı değiştirince mevcut sonuçlar yenilenir.",
         )
         st.caption("Kayıt adımı 1 sn · ⅓ oktav · Başlangıç senkronizasyonu kapalı")
@@ -948,6 +1001,7 @@ def measurement_form(st):
         maximum_peaks=maximum_peaks, variable_baseline=True, variable_spectrum=True,
         spectrum_filter=spectrum_filter, reference_spectrum=reference_spectrum, detailed_svl=True,
         spectrum_revision=SPECTRUM_REVISION,
+        reference_dynamics=True,
         device_serial=device_serial,
         calibration_enabled=True,
         independent_range=independent_range,
@@ -1006,7 +1060,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
                   reference_spectrum=False, detailed_svl=False, device_serial=None,
-                  independent_range=None, calibration_enabled=False, spectrum_revision=SPECTRUM_REVISION):
+                  independent_range=None, calibration_enabled=False, spectrum_revision=SPECTRUM_REVISION,
+                  reference_dynamics=False):
     if not isinstance(clock, time):
         raise ValueError("Başlangıç saatini saat:dakika:saniye biçiminde gir. Örnek 14:25:22.")
     record_name = slug(name)
@@ -1101,7 +1156,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                                  variable_spectrum=variable_spectrum, spectrum_filter=spectrum_filter,
                                  reference_spectrum=reference_spectrum and not is_background,
                                  detailed_svl=detailed_svl, device_serial=device_serial,
-                                 calibration_at=calibration_at, spectrum_revision=spectrum_revision)
+                                 calibration_at=calibration_at, spectrum_revision=spectrum_revision,
+                                 reference_dynamics=reference_dynamics and reference_spectrum and not is_background)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
