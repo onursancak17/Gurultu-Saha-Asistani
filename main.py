@@ -702,6 +702,9 @@ def load_saved_run(st):
                 inputs["day"] = date.fromisoformat(inputs["day"])
             if isinstance(inputs["clock"], str):
                 inputs["clock"] = time.fromisoformat(inputs["clock"])
+            inputs.pop("calibration_enabled", None)
+            if isinstance(inputs.get("calibration_at"), str):
+                inputs["calibration_at"] = datetime.fromisoformat(inputs["calibration_at"])
             seed = saved_run["seed"]
             revision = inputs.setdefault("spectrum_revision", 1)
             if revision < SPECTRUM_REVISION:
@@ -727,15 +730,17 @@ def reset_workspace(st):
             del st.session_state[key]
 
 
-def work_field(st, widget, key, label, default=None, *, multiple=False, **options):
+def work_field(st, widget, key, label, default=None, *, multiple=False, deserialize=None, **options):
     draft = st.session_state.noise_workspace["draft"]
     defaults = st.session_state.setdefault("noise_defaults", {})
     widget_key = f"noise_field_{key}"
     if widget_key not in st.session_state:
         saved = draft.get(key, default)
-        if isinstance(saved, str) and isinstance(default, (date, time)):
+        if deserialize is None and isinstance(default, (date, time)):
+            deserialize = type(default).fromisoformat
+        if isinstance(saved, str) and deserialize is not None:
             try:
-                saved = type(default).fromisoformat(saved)
+                saved = deserialize(saved)
             except ValueError:
                 saved = default
         defaults[key] = saved
@@ -801,6 +806,9 @@ def render_workspace(st):
         saved_run["inputs"].get("reference_spectrum", False) != inputs["reference_spectrum"]
     )
     if st.button("Ölçüm Yap", type="primary", use_container_width=True) or limit_changed or filter_changed or profile_changed:
+        if inputs["calibration_at"] is None:
+            st.error("Kalibrasyon tarihini seç ve saati HH:MM veya HH:MM:SS biçiminde gir.")
+            return
         try:
             seed = token_hex(16)
             st.session_state.results = build_results(**inputs, seed=seed)
@@ -893,9 +901,25 @@ def measurement_form(st):
             placeholder="14:25:22",
             help="Saat, dakika ve saniyeyi gir. SVL başlığı tek saniyeleri bir önceki çift saniyeye kaydeder.",
         ).strip()
+        calibration_date_col, calibration_time_col = st.columns(2)
+        calibration_day = field(
+            calibration_date_col.date_input, "calibration_day", "Kalibrasyon tarihi", None,
+            deserialize=date.fromisoformat, format="DD.MM.YYYY",
+            min_value=date(2000, 1, 1), max_value=date(2127, 12, 31),
+        )
+        calibration_text = field(
+            calibration_time_col.text_input, "calibration_hms", "Kalibrasyon saati", "",
+            placeholder="14:15:20",
+            help="HH:MM veya HH:MM:SS biçiminde gir. SVL başlığı tek saniyeleri bir önceki çift saniyeye kaydeder.",
+        ).strip()
     clock = None
     if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]", clock_text):
         clock = time.fromisoformat(clock_text)
+    calibration_at = None
+    if calibration_day is not None and re.fullmatch(
+        r"(?:[01][0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9])?", calibration_text,
+    ):
+        calibration_at = datetime.combine(calibration_day, time.fromisoformat(calibration_text))
     default_minutes = (5, 10, 30)[PERIODS.index(period)]
     period_min = field(st.number_input, "period_min", "Kaynağın tam çalışma döngüsü (dk, biliniyorsa)", 0, min_value=0, max_value=60)
     recommended = max(default_minutes, period_min)
@@ -1003,7 +1027,7 @@ def measurement_form(st):
         spectrum_revision=SPECTRUM_REVISION,
         reference_dynamics=True,
         device_serial=device_serial,
-        calibration_enabled=True,
+        calibration_at=calibration_at,
         independent_range=independent_range,
         gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
@@ -1060,7 +1084,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   a_bounds=None, c_bounds=None, manual_targets=(), maximum_peaks=None,
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
                   reference_spectrum=False, detailed_svl=False, device_serial=None,
-                  independent_range=None, calibration_enabled=False, spectrum_revision=SPECTRUM_REVISION,
+                  independent_range=None, calibration_at=None, spectrum_revision=SPECTRUM_REVISION,
                   reference_dynamics=False):
     if not isinstance(clock, time):
         raise ValueError("Başlangıç saatini saat:dakika:saniye biçiminde gir. Örnek 14:25:22.")
@@ -1098,19 +1122,6 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     plant = plant.strip()
     title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
     next_start = datetime.combine(day, clock)
-    calibration_at = None
-    if calibration_enabled:
-        seconds_since_midnight = clock.hour * 3600 + clock.minute * 60 + clock.second
-        if seconds_since_midnight < 480:
-            raise ValueError(
-                "Aynı tarihte 8–10 dakika önce kalibrasyon için başlangıç saati en erken 00:08:00 olabilir."
-            )
-        calibration_rng = Random(f"{seed}|pre-calibration")
-        # Calibration timestamps use the SVL header's two-second resolution.
-        delay_seconds = calibration_rng.randrange(
-            480 + clock.second % 2, min(600, seconds_since_midnight) + 1, 2,
-        )
-        calibration_at = next_start - timedelta(seconds=delay_seconds)
     duration = timedelta(minutes=minutes)
     if maximum_peaks is not None and maximum_peaks < 0:
         raise ValueError("Maksimum pik sayısı negatif olamaz.")
@@ -1248,6 +1259,8 @@ def show_results(st):
             f"Kalibrasyon · {config.calibration_at:%d.%m.%Y %H:%M:%S} · "
             "94,00 dB · Katsayı +1,36 dB"
         )
+        if config.calibration_at.second % 2:
+            st.caption("SVL başlığı kalibrasyon saatini bir önceki çift saniyeye kaydeder.")
     if saved_maximum is not None:
         st.metric("Bu kayıttaki pik / girilen üst sınır", f"{len(data.peak_starts)} / {saved_maximum}")
     show_noise_chart(st, data, key=f"noise_history_{chart_key}")
