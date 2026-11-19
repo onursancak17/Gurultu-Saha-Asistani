@@ -63,6 +63,7 @@ DEVICE_SERIALS = (107410, 107406, 23287)
 UNAVAILABLE = 0xD000
 STAT_LEVELS = (1, 10, 20, 30, 40, 50, 60, 70, 80, 90)
 STAT_CLASSES = 120
+MUSIC_BANDS = tuple(index for index, frequency in enumerate(FREQUENCIES) if 63 <= frequency <= 250)
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,10 @@ class Measurement:
     calibration_at: datetime | None = None
     spectrum_revision: int = SPECTRUM_REVISION
     reference_dynamics: bool = False
+    point_number: int = 1
+    point_name: str = ""
+    is_background: bool = False
+    receiver_sound_on: bool = False
 
 
 @dataclass(frozen=True)
@@ -954,6 +959,7 @@ def measurement_form(st):
         )
         st.caption(f"Boş bırakılan sınırlar için referansın ±{DEFAULT_POINT_VARIATION_DB:g} dB çevresi kullanılır.")
     manual_targets = []
+    receiver_sound_on_points = []
     if field(st.checkbox, "set_point_targets", "Nokta bazında manuel hedef belirle", False):
         selected = field(
             st.multiselect, "manual_points", "Manuel hedef verilecek noktalar", [],
@@ -961,10 +967,14 @@ def measurement_form(st):
             format_func=lambda number: f"{number}. nokta · {plant}{number}",
         )
         for number in sorted(set(selected).intersection(point_numbers)):
-            manual_a = field(st.number_input, f"point_a_{number}", f"{plant}{number} · Nihai LAeq [dB(A)]", a,
+            a_col, c_col, sound_col = st.columns((3, 3, 1), vertical_alignment="bottom")
+            manual_a = field(a_col.number_input, f"point_a_{number}", f"{plant}{number} · Nihai LAeq [dB(A)]", a,
                              min_value=25.0, max_value=139.0, step=0.01)
-            manual_c = field(st.number_input, f"point_c_{number}", f"{plant}{number} · Nihai LCeq [dB(C)]",
+            manual_c = field(c_col.number_input, f"point_c_{number}", f"{plant}{number} · Nihai LCeq [dB(C)]",
                              min_value=-10.0, max_value=145.0, step=0.01, placeholder="Otomatik")
+            if field(sound_col.checkbox, f"receiver_sound_on_{number}", "Var", False,
+                     help=f"{plant}{number} · Alıcı önünde ses var. 63–250 Hz müzik yayını değerlendirmesini açar."):
+                receiver_sound_on_points.append(number)
             manual_targets.append((number, manual_a, manual_c))
     previous_count = draft.get("peak_count", 0) if draft.get("character") == "Pikli" else 0
     maximum_peaks = field(
@@ -1017,6 +1027,8 @@ def measurement_form(st):
                  "Bu ayarı değiştirince mevcut sonuçlar yenilenir.",
         )
         st.caption("Kayıt adımı 1 sn · ⅓ oktav · Başlangıç senkronizasyonu kapalı")
+    if receiver_sound_on_points and background is None:
+        st.info("Var seçilen noktaların müzik katkısını hesaplamak için arka plan kaydı ekle.")
     return dict(
         plant=plant, point=point, setting=setting, mode=mode, day=day, clock=clock,
         site_notes=site_notes,
@@ -1031,6 +1043,7 @@ def measurement_form(st):
         independent_range=independent_range,
         gap_seconds=gap_seconds, following_points=following_points,
         a_bounds=a_bounds, c_bounds=c_bounds, manual_targets=manual_targets,
+        receiver_sound_on_points=receiver_sound_on_points,
     )
 
 
@@ -1085,7 +1098,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                   variable_baseline=False, variable_spectrum=False, spectrum_filter="Z",
                   reference_spectrum=False, detailed_svl=False, device_serial=None,
                   independent_range=None, calibration_at=None, spectrum_revision=SPECTRUM_REVISION,
-                  reference_dynamics=False):
+                  reference_dynamics=False, receiver_sound_on_points=()):
     if not isinstance(clock, time):
         raise ValueError("Başlangıç saatini saat:dakika:saniye biçiminde gir. Örnek 14:25:22.")
     record_name = slug(name)
@@ -1111,6 +1124,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
         points.append((next_point.strip(), transition))
     multi_point = len(points) > 1
     overrides = {number: (level_a, level_c) for number, level_a, level_c in manual_targets}
+    receiver_sound_on_points = set(receiver_sound_on_points).intersection(overrides)
     if a_bounds is not None and not a_bounds[0] <= a <= a_bounds[1]:
         raise ValueError("Referans LAeq, alt ve üst LAeq sınırlarının arasında olmalı.")
     if c_bounds is not None and (None in c_bounds or c_bounds[0] > c_bounds[1]):
@@ -1168,7 +1182,9 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                                  reference_spectrum=reference_spectrum and not is_background,
                                  detailed_svl=detailed_svl, device_serial=device_serial,
                                  calibration_at=calibration_at, spectrum_revision=spectrum_revision,
-                                 reference_dynamics=reference_dynamics and reference_spectrum and not is_background)
+                                 reference_dynamics=reference_dynamics and reference_spectrum and not is_background,
+                                 point_number=number, point_name=point_name, is_background=is_background,
+                                 receiver_sound_on=number in receiver_sound_on_points)
             try:
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
@@ -1190,6 +1206,117 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             rows.append((label, filename, config, data, svl(config, data, file_stem)))
         next_start = config.start + duration
     return title, rows, site_notes
+
+
+def music_period_windows(config):
+    """Yield the local regulation period and sample span of each part of a record."""
+    offset = 0
+    while offset < config.seconds:
+        start = config.start + timedelta(seconds=offset)
+        if 7 <= start.hour < 19:
+            period, limit, end_hour = "Gündüz", 60, 19
+        elif 19 <= start.hour < 23:
+            period, limit, end_hour = "Akşam", 55, 23
+        else:
+            period, limit, end_hour = "Gece", 50, 7
+        boundary = start.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+        if boundary <= start:
+            boundary += timedelta(days=1)
+        stop = min(config.seconds, offset + int((boundary - start).total_seconds()))
+        yield period, limit, boundary, offset, stop
+        offset = stop
+
+
+def music_band_energy(config, data, start=0, stop=None):
+    """Return mean A-weighted energy for each of the seven ⅓-octave bands."""
+    stop = config.seconds if stop is None else stop
+    if start == 0 and stop == config.seconds:
+        levels = average_bands(data)
+        powers = [energy(levels[index] / 100) for index in MUSIC_BANDS]
+    elif data.spectral_rows:
+        row_size = 38 * 2  # flags, three profiles, 31 bands and three totals
+        totals = [0.0] * len(MUSIC_BANDS)
+        for sample in iter_unpack("<38H", data.spectral_rows[start * row_size:stop * row_size]):
+            for position, index in enumerate(MUSIC_BANDS):
+                totals[position] += energy(sample[4 + index] / 100)
+        powers = [total / (stop - start) for total in totals]
+    else:
+        levels = data.a[start:stop]
+        powers = [
+            sum(energy(max(data.octave_floor, level + data.spectrum_offsets[index]) / 100) for level in levels)
+            / len(levels)
+            for index in MUSIC_BANDS
+        ]
+    if config.spectrum_filter == "Z":
+        return [power * energy(A_WEIGHT[index]) for power, index in zip(powers, MUSIC_BANDS)]
+    return powers
+
+
+def music_band_assessment(source_on, background, limit):
+    bands = []
+    for index, on_power, off_power in zip(MUSIC_BANDS, source_on, background):
+        total = 10 * log10(on_power)
+        residual = source = None
+        if off_power is None:
+            status = "Arka plan kaydı yok"
+        else:
+            residual = 10 * log10(off_power)
+            if total - residual <= 3.0 + 1e-9:
+                status = "Fark ≤ 3 dB"
+            else:
+                source = 10 * log10(on_power - off_power)
+                status = "Aşım" if source > limit + 1e-9 else "Sınır içinde"
+        bands.append({
+            "Hz": FREQUENCIES[index], "Ses var [dB(A)]": round(total, 2),
+            "Ses yok [dB(A)]": round(residual, 2) if residual is not None else None,
+            "Müzik katkısı [dB(A)]": round(source, 2) if source is not None else None,
+            "Sınır [dB(A)]": limit, "Sonuç": status,
+        })
+    return bands
+
+
+def show_receiver_assessment(st, rows):
+    selected_points = {}
+    for _, _, config, data, _ in rows:
+        if getattr(config, "receiver_sound_on", False):
+            selected_points.setdefault(config.point_number, []).append((config, data))
+    if not selected_points:
+        return
+    section(st, "Alıcı önünde ses var · 63–250 Hz")
+    st.caption("Simülasyon değerlendirmesi · ÇGK Yönetmeliği Ek-2 Tablo 1 · TS ISO 1996-2 Madde 10.4")
+    for records in selected_points.values():
+        background = [None] * len(MUSIC_BANDS)
+        background_start = None
+        periods = {}
+        for config, data in records:
+            if config.is_background:
+                background = music_band_energy(config, data)
+                background_start = config.start
+                continue
+            for period, limit, boundary, start, stop in music_period_windows(config):
+                powers = music_band_energy(config, data, start, stop)
+                first_sample = config.start + timedelta(seconds=start)
+                periods.setdefault((period, limit, boundary), []).append((first_sample, stop - start, powers))
+        with st.expander(records[0][0].point_name, expanded=len(selected_points) == 1):
+            if background_start is not None:
+                st.caption(f"Ses yok kaydı · {background_start:%d.%m.%Y %H:%M:%S}")
+            for (period, limit, _), segments in periods.items():
+                seconds = sum(length for _, length, _ in segments)
+                powers = [
+                    sum(length * values[index] for _, length, values in segments) / seconds
+                    for index in range(len(MUSIC_BANDS))
+                ]
+                bands = music_band_assessment(powers, background, limit)
+                start, _, _ = segments[0]
+                st.markdown(f"**{period} · {start:%d.%m.%Y %H:%M:%S} · {limit} dB(A)**")
+                statuses = {band["Sonuç"] for band in bands}
+                if "Aşım" in statuses:
+                    st.warning("En az bir bant sınırı aşıyor.")
+                elif statuses == {"Sınır içinde"}:
+                    st.success("Yedi bandın tamamı sınır içinde.")
+                else:
+                    st.info("Bir veya daha fazla bant değerlendirilemedi.")
+                st.dataframe(bands, hide_index=True)
 
 
 def show_results(st):
@@ -1229,6 +1356,7 @@ def show_results(st):
             ], hide_index=True)
     if any(config.start.second % 2 for _, _, config, _, _ in rows):
         st.caption("Çizelge tam başlangıç saatlerini gösterir. SVL başlığı tek saniyeleri önceki çift saniyeye yazar.")
+    show_receiver_assessment(st, rows)
     labels = [row[0] for row in rows]
     run_seed = (workspace.get("run") or {}).get("seed", "restored")
     selection_key = f"noise_field_record_choice_{run_seed}"
