@@ -1151,6 +1151,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
     record_count = len(points) * (repeats + (background is not None))
     sequence_width = max(2, len(str(record_count)))
     for number, (point_name, transition) in enumerate(points, start=first_point):
+        filename = f"{download_name}{number}.svl"
         next_start += timedelta(seconds=transition)
         point_a, point_c = a, c
         spectrum = None
@@ -1168,8 +1169,6 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             is_background = index == repeats
             label = "Arka plan" if is_background else f"Kaynak açık · Tekrar {index + 1}"
             suffix = "FON" if is_background else f"{index + 1:02d}"
-            download_suffix = f"_{suffix}" if index else ""
-            filename = f"{download_name}{number}{download_suffix}.svl"
             if multi_point:
                 label = f"{number}. {point_name} · {label}"
                 suffix = f"N{number:03d}_{suffix}"
@@ -1422,8 +1421,17 @@ def show_results(st):
                        "application/octet-stream", use_container_width=True, on_click="ignore")
     if len(rows) > 1:
         archive = BytesIO()
+        repeats_by_point = {}
         with ZipFile(archive, "w", ZIP_DEFLATED) as bundle:
-            for _, member, _, _, payload in rows:
+            for _, member, record_config, _, payload in rows:
+                if record_config.is_background:
+                    member = f"Arka plan/{member}"
+                else:
+                    point_number = record_config.point_number
+                    repeat_number = repeats_by_point.get(point_number, 0) + 1
+                    repeats_by_point[point_number] = repeat_number
+                    if repeat_number > 1:
+                        member = f"Tekrar {repeat_number}/{member}"
                 bundle.writestr(member, payload)
         archive_name = download_plant_name(saved_inputs.get("plant", "SIMULASYON_SVL"))
         st.download_button("Tüm simülasyon kayıtlarını indir", archive.getvalue(),
