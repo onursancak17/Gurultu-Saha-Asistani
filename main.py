@@ -449,6 +449,10 @@ def slug(value):
     return re.sub(r"[^A-Z0-9_-]", "", value)[:28]
 
 
+def download_plant_name(plant):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", plant.strip())
+
+
 def profile_settings(detailed):
     mask = 15 if detailed else 8
     return [0x1405, 0x0307, 0x0606, 1, 2, mask, 2, 0, 0x0606, 1, 3, mask, 3, 0, 0x0606, 0, 2, mask, 2, 0]
@@ -1134,6 +1138,7 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
         extended=True, reference=reference_spectrum, spectrum_revision=spectrum_revision,
     ) if a_bounds is not None else None
     plant = plant.strip()
+    download_name = download_plant_name(plant)
     title = f"{plant} · {len(points)} ölçüm noktası" if multi_point else f"{plant} / {point.strip()}"
     next_start = datetime.combine(day, clock)
     duration = timedelta(minutes=minutes)
@@ -1163,6 +1168,8 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
             is_background = index == repeats
             label = "Arka plan" if is_background else f"Kaynak açık · Tekrar {index + 1}"
             suffix = "FON" if is_background else f"{index + 1:02d}"
+            download_suffix = f"_{suffix}" if index else ""
+            filename = f"{download_name}{number}{download_suffix}.svl"
             if multi_point:
                 label = f"{number}. {point_name} · {label}"
                 suffix = f"N{number:03d}_{suffix}"
@@ -1189,7 +1196,6 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                 data = simulate(config, rng, None if is_background else spectrum)
             except ValueError as error:
                 raise ValueError(f"{point_name} · {label} · {error}") from error
-            filename = f"SIMULASYON_{record_name}_{suffix}.SVL"
             file_stem = record_name
             if record_count > 1:
                 sequence = f"{len(rows) + 1:0{sequence_width}d}"
@@ -1201,8 +1207,6 @@ def build_results(plant, point, setting, mode, day, clock, minutes, repeats, nam
                     record_suffix = "FON" if is_background else f"{index + 1:02d}"
                     prefix_length = max(0, 8 - len(str(number)) - len(record_suffix))
                     file_stem = slug(plant)[:prefix_length] + str(number) + record_suffix
-                download_suffix = "FON" if is_background else f"{index + 1:02d}"
-                filename = f"SIMULASYON_{slug(point_name)}_{download_suffix}.SVL"
             rows.append((label, filename, config, data, svl(config, data, file_stem)))
         next_start = config.start + duration
     return title, rows, site_notes
@@ -1421,8 +1425,9 @@ def show_results(st):
         with ZipFile(archive, "w", ZIP_DEFLATED) as bundle:
             for _, member, _, _, payload in rows:
                 bundle.writestr(member, payload)
+        archive_name = download_plant_name(saved_inputs.get("plant", "SIMULASYON_SVL"))
         st.download_button("Tüm simülasyon kayıtlarını indir", archive.getvalue(),
-                           "SIMULASYON_SVL.zip", "application/zip",
+                           f"{archive_name}.zip", "application/zip",
                            use_container_width=True, on_click="ignore")
     st.caption("Simülasyon verisi · Eğitim ve yazılım testi")
     selection_storage = st.components.v2.component("noise_workspace_storage", js=WORKSPACE_STORAGE)
